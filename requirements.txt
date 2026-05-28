@@ -1,0 +1,32 @@
+# Core dependencies
+torch
+diffusers==0.30.3
+transformers==4.46.3
+accelerate
+peft
+
+# Hugging Face Hub and Spaces
+huggingface-hub
+spaces
+
+# Image processing
+Pillow
+
+# Web interface - pinned for compatibility
+gradio>=4.0.0
+gradio_client
+
+# Pydantic - pinned to avoid schema generation issues
+pydantic
+
+# Utilities
+numpy
+safetensors
+
+# Tokenizers
+sentencepiece
+protobuf
+
+# Others
+controlnet_aux
+mediapipe
