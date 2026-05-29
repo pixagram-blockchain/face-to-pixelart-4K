@@ -130,13 +130,23 @@ class ModelHandler:
             print(f"  [ERROR] Failed to load ZoeDetector: {e}")
             raise
 
-        # 2. Load ControlNet Depth
-        print("\n[2/4] Loading ControlNet Zoe Depth...")
-        controlnet = ControlNetModel.from_pretrained(
+        # 2. Load ControlNets: Depth (structure/pose) + Canny (face lock)
+        print("\n[2/4] Loading ControlNets (Zoe Depth + Canny)...")
+        depth_controlnet = ControlNetModel.from_pretrained(
             Config.CN_ZOE_REPO,
             torch_dtype=Config.DTYPE
         )
         print("  [OK] ControlNet Depth loaded")
+        canny_controlnet = ControlNetModel.from_pretrained(
+            Config.CN_CANNY_REPO,
+            torch_dtype=Config.DTYPE
+        )
+        print("  [OK] ControlNet Canny loaded (face structure lock)")
+
+        # IMPORTANT: order is [depth, canny] and MUST match the order of
+        # the control-image list and conditioning-scale list passed by
+        # generator.py / tiled_pipeline.py.
+        controlnets = [depth_controlnet, canny_controlnet]
 
         # 3. Load Base Pipeline with checkpoint
         print("\n[3/4] Loading SDXL Pipeline...")
@@ -148,11 +158,11 @@ class ModelHandler:
 
         self.pipeline = StableDiffusionXLControlNetImg2ImgPipeline.from_single_file(
             checkpoint_path,
-            controlnet=controlnet,
+            controlnet=controlnets,
             torch_dtype=Config.DTYPE,
             use_safetensors=True
         )
-        print("  [OK] Pipeline loaded")
+        print("  [OK] Pipeline loaded (MultiControlNet: depth + canny)")
 
         # Load LoRA
         print("\n  Loading LoRA weights...")
@@ -160,9 +170,20 @@ class ModelHandler:
             repo_id=Config.REPO_ID,
             filename=Config.LORA_FILENAME
         )
-        self.pipeline.load_lora_weights(lora_path)
-        self.pipeline.fuse_lora(lora_scale=Config.LORA_STRENGTH)
-        print(f"  [OK] LoRA loaded and fused: {Config.LORA_FILENAME}")
+        self.pipeline.load_lora_weights(lora_path, adapter_name="retroart")
+        # IMPORTANT: do NOT fuse. Fusing bakes a single fixed scale (1.25)
+        # into the UNet, which made the style far too strong — over-cooking
+        # non-portraits and over-stylising faces, with no way to differentiate.
+        # Keeping it as a live PEFT adapter lets generator.py set the style
+        # strength per request via set_adapters(). We seed a sensible default
+        # here; generator overrides it each call.
+        self.pipeline.set_adapters(
+            ["retroart"], adapter_weights=[Config.DEFAULT_LORA_INTENSITY]
+        )
+        print(
+            f"  [OK] LoRA loaded (adapter 'retroart', unfused, "
+            f"default scale {Config.DEFAULT_LORA_INTENSITY}): {Config.LORA_FILENAME}"
+        )
 
         # Setup scheduler
         print("\n  Configuring LCM Scheduler...")

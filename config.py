@@ -31,7 +31,34 @@ class Config:
     REPO_ID = "primerz/pixagram"
     CHECKPOINT_FILENAME = "horizon.safetensors"
     LORA_FILENAME = "retroart.safetensors"
-    LORA_STRENGTH = 1.25  # Fixed strength for fusion
+    LORA_STRENGTH = 1.25  # DEPRECATED: see DEFAULT_LORA_INTENSITY. No longer
+                          # fused. Kept only for back-compat.
+
+    # Runtime LoRA style intensity. The LoRA is loaded UNFUSED and the
+    # generator sets its scale live per request. DEFAULT_LORA_INTENSITY is the
+    # BASE value exposed through the API/UI; the generator multiplies it by a
+    # face/non-face factor:
+    #     effective = clamp(lora_intensity * (FACE_MULT if face else NOFACE_MULT))
+    # Faces are boosted (the canny lock already holds their structure, so more
+    # style is safe and adds pixel-art punch); non-faces are attenuated to
+    # avoid the over-cooked / artifacted look.
+    DEFAULT_LORA_INTENSITY = 0.75
+    LORA_FACE_MULTIPLIER = 1.2
+    LORA_NOFACE_MULTIPLIER = 0.6
+    # Hard clamp on the effective scale after multiplication.
+    LORA_INTENSITY_MAX = 2.0
+
+    # img2img strength multipliers. The canny face lock now preserves facial
+    # structure during diffusion, so faces no longer need a starved strength
+    # to keep identity — they run at full (x1.0). Non-faces have no structural
+    # lock, so we halve their redraw (x0.5) to stay close to the source and
+    # avoid the over-transformed / wrong-result look.
+    IMG_FACE_MULTIPLIER = 1.0
+    IMG_NOFACE_MULTIPLIER = 0.5
+    # Clamp range for the effective img2img strength after multiplication.
+    IMG_STRENGTH_MIN = 0.1
+    IMG_STRENGTH_MAX = 1.0
+
     DEFAULT_GUIDANCE_SCALE = 1.2
     DEFAULT_NUM_INFERENCE_STEPS = 10
     DEFAULT_SEED = 42
@@ -50,6 +77,31 @@ class Config:
     # CONTROLNET CONFIGURATION
     # ============================================================
     CN_ZOE_REPO = "diffusers/controlnet-zoe-depth-sdxl-1.0"
+
+    # Canny ControlNet for FACE STRUCTURE LOCK (Apache-2.0).
+    # We run a second ControlNet whose conditioning image is the Canny
+    # edge map of the input, MASKED to the face region only. This forces
+    # the diffusion to follow the *actual facial feature lines* of the
+    # real person — the thing depth alone can't do — so the output is the
+    # same individual rather than a freshly-invented "alternative face".
+    # xinsir's canny is Apache-2.0 and higher quality than the diffusers one.
+    CN_CANNY_REPO = "xinsir/controlnet-canny-sdxl-1.0"
+
+    # Canny hysteresis thresholds (OpenCV, BSD).
+    CANNY_LOW = 100
+    CANNY_HIGH = 200
+
+    # Per-edge expansion of the face bbox (as a fraction of face size)
+    # for the canny mask. A little context around the face helps the
+    # jaw/hairline edges land correctly.
+    FACE_CANNY_DILATE = 0.25
+
+    # ControlNet conditioning scale for the (face-masked) canny map.
+    # Because edges exist ONLY inside the face box, this effectively only
+    # constrains the face. ~0.5-0.6 locks identity without fighting the
+    # LoRA's stylization. Turn UP for stricter identity, DOWN if the face
+    # comes out too photo-like / under-stylized.
+    FACE_CANNY_SCALE = 0.55
 
     # Preprocessor (Annotator) Repo
     ANNOTATOR_REPO = "lllyasviel/Annotators"

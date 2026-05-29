@@ -94,13 +94,13 @@ def tiled_controlnet_img2img(
     prompt: str,
     negative_prompt: str,
     image: Image.Image,
-    control_image: Image.Image,
+    control_images: List[Image.Image],
     width: int,
     height: int,
     num_inference_steps: int,
     guidance_scale: float,
     strength: float,
-    controlnet_conditioning_scale: float,
+    controlnet_conditioning_scales: List[float],
     generator: torch.Generator,
     clip_skip: Optional[int] = None,
     tile_size_px: int = 768,
@@ -110,19 +110,25 @@ def tiled_controlnet_img2img(
     """
     Tiled MultiDiffusion denoising over an SDXL ControlNet img2img pipeline.
 
+    Supports MultiControlNet: `control_images` and
+    `controlnet_conditioning_scales` are parallel lists (e.g. [depth, canny]
+    and [depth_scale, canny_scale]) whose order matches the order the
+    ControlNets were registered on the pipeline.
+
     Args:
-        pipe: An instance of StableDiffusionXLControlNetImg2ImgPipeline (or
-              a subclass like our StableDiffusionXLControlNetImg2ImgPipelineCustom).
-        prompt / negative_prompt: Text conditioning, applied identically to every tile.
-        image: Full-resolution input PIL image (RGB), already sized to (width, height).
-        control_image: Full-resolution depth/control PIL image.
-        width, height: Target generation dimensions (must be multiples of 8).
-        num_inference_steps, guidance_scale, strength, controlnet_conditioning_scale:
-            Standard diffusion knobs, applied per tile.
+        pipe: StableDiffusionXLControlNetImg2ImgPipeline whose `controlnet`
+              is a MultiControlNetModel (or a single ControlNetModel, in
+              which case pass single-element lists).
+        prompt / negative_prompt: Text conditioning, identical for every tile.
+        image: Full-resolution input PIL image (RGB), sized to (width, height).
+        control_images: List of full-resolution control PIL images.
+        width, height: Target generation dimensions (multiples of 8).
+        num_inference_steps, guidance_scale, strength: Standard knobs.
+        controlnet_conditioning_scales: Per-ControlNet conditioning scales.
         generator: torch.Generator for reproducibility.
         clip_skip: Optional clip skip.
-        tile_size_px: Pixel tile size (default 768). Will be converted to latent units (÷8).
-        tile_overlap_px: Pixel overlap between adjacent tiles (default 192 = 25% of 768).
+        tile_size_px: Pixel tile size (default 768). Converted to latent (÷8).
+        tile_overlap_px: Pixel overlap between adjacent tiles.
         callback: Optional fn(step_index, total_steps) for progress updates.
 
     Returns:
@@ -149,23 +155,32 @@ def tiled_controlnet_img2img(
         clip_skip=clip_skip,
     )
 
-    # --- 2. Preprocess image and control_image to tensors -------------------
+    # --- 2. Preprocess image and control_images to tensors -----------------
     image_t = pipe.image_processor.preprocess(image, height=height, width=width).to(
         dtype=torch.float32
     )
 
-    control_t = pipe.prepare_control_image(
-        image=control_image,
-        width=width,
-        height=height,
-        batch_size=1,
-        num_images_per_prompt=1,
-        device=device,
-        dtype=pipe.controlnet.dtype,
-        do_classifier_free_guidance=do_cfg,
-        guess_mode=False,
-    )
-    # control_t shape: (2, 3, H, W) if CFG else (1, 3, H, W)
+    # ControlNet dtype: MultiControlNetModel has no .dtype, so fall back to
+    # its first sub-net. Works for a single ControlNetModel too.
+    cn_dtype = getattr(pipe.controlnet, "dtype", None)
+    if cn_dtype is None:
+        cn_dtype = pipe.controlnet.nets[0].dtype
+
+    control_ts = [
+        pipe.prepare_control_image(
+            image=ci,
+            width=width,
+            height=height,
+            batch_size=1,
+            num_images_per_prompt=1,
+            device=device,
+            dtype=cn_dtype,
+            do_classifier_free_guidance=do_cfg,
+            guess_mode=False,
+        )
+        for ci in control_images
+    ]
+    # each control_t shape: (2, 3, H, W) if CFG else (1, 3, H, W)
 
     # --- 3. Timesteps --------------------------------------------------------
     pipe.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -278,10 +293,10 @@ def tiled_controlnet_img2img(
                 # Slice latent for this tile
                 lat_tile = latents[:, :, y1:y2, x1:x2]
 
-                # Slice control image — control_t is in pixel space (8x bigger)
+                # Slice each control image — control_ts are pixel space (8x).
                 py1, py2 = y1 * 8, y2 * 8
                 px1, px2 = x1 * 8, x2 * 8
-                ctrl_tile = control_t[:, :, py1:py2, px1:px2]
+                ctrl_tiles = [ct[:, :, py1:py2, px1:px2] for ct in control_ts]
 
                 # Expand for CFG and scale
                 latent_model_input = (
@@ -291,15 +306,18 @@ def tiled_controlnet_img2img(
                     latent_model_input, t
                 )
 
-                cond_scale = controlnet_conditioning_scale * controlnet_keep[i]
+                # Per-ControlNet conditioning scales, gated by the keep schedule.
+                cond_scales = [
+                    s * controlnet_keep[i] for s in controlnet_conditioning_scales
+                ]
 
-                # ControlNet
+                # ControlNet (MultiControlNetModel: lists in, summed residuals out)
                 down_res, mid_res = pipe.controlnet(
                     latent_model_input,
                     t,
                     encoder_hidden_states=prompt_embeds,
-                    controlnet_cond=ctrl_tile,
-                    conditioning_scale=cond_scale,
+                    controlnet_cond=ctrl_tiles,
+                    conditioning_scale=cond_scales,
                     guess_mode=False,
                     added_cond_kwargs=added_cond_kwargs,
                     return_dict=False,
@@ -327,7 +345,7 @@ def tiled_controlnet_img2img(
                 weight_sum[:, :, y1:y2, x1:x2] += tile_weight
 
                 # Free per-tile activations
-                del down_res, mid_res, noise_pred_tile, latent_model_input, ctrl_tile
+                del down_res, mid_res, noise_pred_tile, latent_model_input, ctrl_tiles
 
         # Normalize accumulated noise prediction
         noise_pred_full = noise_pred_full / weight_sum.clamp(min=1e-8)

@@ -174,8 +174,7 @@ with gr.Blocks(
                     step=0.05,
                     info=(
                         "Pixel-art style strength. Applied x1.2 on faces and "
-                        "x0.8 on images without a face. Lower if the style "
-                        "overwhelms the subject; higher for more punch."
+                        "x0.6 on images without a face."
                     ),
                 )
 
@@ -186,9 +185,8 @@ with gr.Blocks(
                     value=IMG_STRENGTH,
                     step=0.05,
                     info=(
-                        "How much the model redraws vs. keeps the original. "
-                        "Auto-reduced on faces to preserve identity. Lower = "
-                        "closer to the source image."
+                        "img2img. Applied x1.0 (no changes) on faces and "
+                        "x0.5 on images without a face."
                     ),
                 )
 
