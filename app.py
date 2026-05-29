@@ -34,6 +34,8 @@ from config import (
     TILE_SIZE,
     TILE_OVERLAP,
     DEFAULT_USE_TILED,
+    DEFAULT_LORA_INTENSITY,
+    IMG_STRENGTH,
 )
 from generator import generate_pixel_art
 from utils import create_seed
@@ -45,6 +47,8 @@ def process_image(
     additional_prompt: str,
     guidance_scale: float,
     num_inference_steps: int,
+    lora_intensity: float,
+    img2img_strength: float,
     seed: int,
     face_preserve: bool,
     face_blend_strength: float,
@@ -86,6 +90,8 @@ def process_image(
             additional_prompt=additional_prompt,
             guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
+            lora_intensity=lora_intensity,
+            img2img_strength=img2img_strength,
             seed=seed,
             face_preserve=face_preserve,
             face_blend_strength=face_blend_strength,
@@ -159,7 +165,33 @@ with gr.Blocks(
                     step=1,
                     info="More steps = higher quality but slower (16 recommended for speed)",
                 )
-                
+
+                lora_intensity = gr.Slider(
+                    label="🎨 Style Intensity (LoRA)",
+                    minimum=0.0,
+                    maximum=1.5,
+                    value=DEFAULT_LORA_INTENSITY,
+                    step=0.05,
+                    info=(
+                        "Pixel-art style strength. Applied x1.2 on faces and "
+                        "x0.8 on images without a face. Lower if the style "
+                        "overwhelms the subject; higher for more punch."
+                    ),
+                )
+
+                img2img_strength = gr.Slider(
+                    label="🖌️ Image Strength (img2img)",
+                    minimum=0.1,
+                    maximum=1.0,
+                    value=IMG_STRENGTH,
+                    step=0.05,
+                    info=(
+                        "How much the model redraws vs. keeps the original. "
+                        "Auto-reduced on faces to preserve identity. Lower = "
+                        "closer to the source image."
+                    ),
+                )
+
                 with gr.Row():
                     seed = gr.Number(
                         label="Seed",
@@ -285,6 +317,8 @@ with gr.Blocks(
             additional_prompt,
             guidance_scale,
             num_inference_steps,
+            lora_intensity,
+            img2img_strength,
             seed,
             face_preserve,
             face_blend_strength,
