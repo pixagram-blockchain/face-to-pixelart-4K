@@ -99,6 +99,7 @@ def _build_rich_prompt(
     prepared_image: Image.Image,
     additional_prompt: str,
     face_confirmed: bool,
+    preserve_identity: bool = False,
 ) -> str:
     """
     Build a high-quality prompt by combining:
@@ -126,12 +127,17 @@ def _build_rich_prompt(
     except Exception as e:
         print(f"[Generator] Captioning failed (non-fatal): {e}")
 
-    # Face attribute enrichment: ONLY when MTCNN confirms a real face.
-    # The Haar cascade analyzer is over-eager on textured natural images
-    # (foliage, brick, clouds) and we used to feed those false positives
-    # into the prompt as "young woman, brown hair...". Combined with the
-    # depth boost, that forces SDXL to paint a face that wasn't there.
-    if face_confirmed and AUTO_FACEID:
+    # Face attribute enrichment.
+    #
+    # IMPORTANT: generic descriptors like "young woman, brown hair, oval
+    # face" describe a *category*, not a specific person. Feeding them to
+    # SDXL alongside a depth-only ControlNet (which fixes pose but not
+    # identity) is a recipe for the model to paint a brand-new, plausible
+    # face that merely *matches the description* — i.e. "an alternative
+    # face that doesn't exist". We therefore only add these descriptors
+    # when the user has explicitly opted out of identity preservation;
+    # otherwise we let the img2img latents + depth carry the face.
+    if face_confirmed and AUTO_FACEID and not preserve_identity:
         try:
             analyzer = get_face_analyzer()
             if analyzer is not None:
@@ -277,7 +283,10 @@ def generate_pixel_art(
     # Build a rich prompt. When face_confirmed is False, the trigger
     # drops "portrait" and no face attributes are added — so SDXL
     # won't be biased into generating a face that wasn't there.
-    prompt = _build_rich_prompt(prepared_image, additional_prompt, face_confirmed)
+    prompt = _build_rich_prompt(
+        prepared_image, additional_prompt, face_confirmed,
+        preserve_identity=face_preserve,
+    )
     print(f"[Generator] Prompt: {prompt[:120]}...")
     print(
         f"[Generator] Resolution {target_width}x{target_height} "
@@ -309,11 +318,14 @@ def generate_pixel_art(
     if face_confirmed:
         print("[Generator] Applying depth boost & strength reduction for confirmed face")
         depth_image = _boost_depth_for_faces(depth_image, face_bboxes)
-        # Stronger reduction than the old default (0.12 -> 0.20). This
-        # is the single biggest knob for "truthfulness to the original":
-        # lower strength = more of the input pixels survive into the
-        # output, which is what we want for faces.
-        face_strength_reduction = max(FACE_STRENGTH_REDUCTION, 0.20)
+        # Strength is the single biggest knob for "truthfulness to the
+        # original": lower strength = more input pixels survive = the
+        # SAME face instead of a freshly-invented one. At the previous
+        # effective 0.43 the LoRA still had enough latitude to redraw the
+        # face into a different person. 0.35 keeps ~65% of the original
+        # face structure. Tune DOWN toward 0.30 if faces still drift,
+        # UP toward 0.45 if the face isn't getting stylised enough.
+        face_strength_reduction = max(FACE_STRENGTH_REDUCTION, 0.30)
         img_strength = max(0.30, IMG_STRENGTH - face_strength_reduction)
         depth_strength = min(1.0, DEPTH_STRENGTH + 0.1)
 

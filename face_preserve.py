@@ -15,7 +15,7 @@ Strategy:
 
 import torch
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageOps
 from typing import Optional, Tuple, List
 from dataclasses import dataclass
 
@@ -342,16 +342,18 @@ def _is_valid_match(
       2. Bounding boxes overlap (IoU >= MIN_BBOX_IOU)
       3. Bbox area ratio within MAX_AREA_RATIO
 
-    Rejecting on any of these stops us from blending a phantom face
-    onto the wrong region of the output.
+    All three conditions are checked, but with one crucial asymmetry:
+    STRONG spatial overlap (same location + comparable size) is treated as
+    proof this is the same face, so a LOW embedding similarity is read as
+    identity DRIFT to be corrected rather than as "a different person".
+
+    Gating drift-correction behind a same-person similarity floor was
+    backwards: the worse a face drifts, the lower its similarity, the more
+    certainly the old code skipped it as "different identity" — which is
+    exactly why hard-drifted faces never got fixed. Both images already
+    cleared high-confidence detection upstream (input >=0.97, output
+    >=0.985), so a strongly-overlapping phantom match is very unlikely.
     """
-    if similarity < MIN_SAME_PERSON_SIM:
-        return False, f"different identity (sim={similarity:.2f})"
-
-    iou = _bbox_iou(orig_face.bbox, gen_face.bbox)
-    if iou < MIN_BBOX_IOU:
-        return False, f"misaligned (iou={iou:.2f})"
-
     a_orig = _bbox_area(orig_face.bbox)
     a_gen = _bbox_area(gen_face.bbox)
     if a_orig == 0 or a_gen == 0:
@@ -359,6 +361,20 @@ def _is_valid_match(
     ratio = max(a_orig, a_gen) / min(a_orig, a_gen)
     if ratio > MAX_AREA_RATIO:
         return False, f"area mismatch ({ratio:.1f}x)"
+
+    iou = _bbox_iou(orig_face.bbox, gen_face.bbox)
+
+    # Same face region (and sane size) -> blend regardless of similarity.
+    STRONG_IOU = 0.55
+    if iou >= STRONG_IOU:
+        return True, f"ok (spatial iou={iou:.2f})"
+
+    # Weaker overlap: fall back to requiring embedding agreement so we
+    # don't pair two genuinely different faces that merely sit nearby.
+    if similarity < MIN_SAME_PERSON_SIM:
+        return False, f"different identity (sim={similarity:.2f})"
+    if iou < MIN_BBOX_IOU:
+        return False, f"misaligned (iou={iou:.2f})"
 
     return True, "ok"
 
@@ -457,6 +473,13 @@ def blend_face_identity(
     if original.size != generated.size:
         original = original.resize(generated.size, Image.Resampling.LANCZOS)
 
+    # We paste ORIGINAL pixels back over the stylised output where identity
+    # drifted. Raw photo pixels on a pixel-art body look jarring and fight
+    # the negative prompt ("photo, photo-realistic"). Posterise the source
+    # so the restored face still reads as pixel art. Lower `bits` = chunkier
+    # colour; 4 bits (16 levels/channel) is a mild, safe default.
+    original_styled = ImageOps.posterize(original.convert("RGB"), 4)
+
     result = generated.copy()
     face_reports: List[dict] = []
 
@@ -520,7 +543,7 @@ def blend_face_identity(
         mask_np *= effective_strength
 
         gen_np = np.array(result).astype(np.float32)
-        orig_np = np.array(original).astype(np.float32)
+        orig_np = np.array(original_styled).astype(np.float32)
         mask_3ch = np.stack([mask_np] * 3, axis=-1)
         blended_np = gen_np * (1.0 - mask_3ch) + orig_np * mask_3ch
         result = Image.fromarray(blended_np.clip(0, 255).astype(np.uint8))
