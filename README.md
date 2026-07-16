@@ -1,12 +1,12 @@
 ---
-title: Image To Pixel Art 4K
+title: Image To Pixel Art
 emoji: 💻
 colorFrom: purple
 colorTo: pink
 sdk: gradio
 sdk_version: 6.3.0
 app_file: app.py
-pinned: true
+pinned: false
 license: gpl-3.0
 short_description: Transform any image with face into retro pixel art style!
 disable_embedding: false

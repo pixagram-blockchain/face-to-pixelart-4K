@@ -152,6 +152,55 @@ def has_face(image: Image.Image) -> bool:
     return len(faces) > 0
 
 
+def match_colors_lab(
+    src: Image.Image,
+    ref: Image.Image,
+    strength: float = 1.0,
+) -> Image.Image:
+    """
+    Reinhard colour transfer: rescale `src` so its per-channel mean/std in LAB
+    match `ref`, then blend by `strength` (0 = unchanged, 1 = full match).
+
+    Used to remove hue/exposure drift between independently-generated tiles by
+    pulling the stitched mosaic back toward a globally-coherent reference
+    (e.g. the upscaled base pass). Operating in LAB corrects luminance and
+    colour without destroying detail. OpenCV (BSD) + NumPy — no new deps.
+
+    Args:
+        src: image to recolour (the tile mosaic).
+        ref: reference whose colour statistics to match.
+        strength: 0..1 blend between the original and the fully-matched result.
+
+    Returns:
+        Recoloured PIL image, same size as `src`.
+    """
+    strength = float(max(0.0, min(1.0, strength)))
+    if strength == 0.0:
+        return src
+
+    src_rgb = np.asarray(src.convert("RGB"))
+    ref_rgb = np.asarray(ref.convert("RGB").resize(src.size, Image.LANCZOS))
+
+    s = cv2.cvtColor(src_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    r = cv2.cvtColor(ref_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+
+    out = s.copy()
+    for c in range(3):
+        s_mean, s_std = float(s[..., c].mean()), float(s[..., c].std())
+        r_mean, r_std = float(r[..., c].mean()), float(r[..., c].std())
+        if s_std < 1e-5:
+            # Flat channel (e.g. a uniform sky tile): can't rescale by a std
+            # ratio, but still shift the mean so the tone matches the ref.
+            out[..., c] = s[..., c] - s_mean + r_mean
+        else:
+            out[..., c] = (s[..., c] - s_mean) * (r_std / s_std) + r_mean
+
+    out = np.clip(out, 0, 255)
+    matched = np.clip(s * (1.0 - strength) + out * strength, 0, 255).astype(np.uint8)
+    rgb = cv2.cvtColor(matched, cv2.COLOR_LAB2RGB)
+    return Image.fromarray(rgb)
+
+
 def visualize_face_detection(
     image: Image.Image,
     color: Tuple[int, int, int] = (0, 255, 0),

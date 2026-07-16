@@ -30,3 +30,10 @@ protobuf
 # Others
 controlnet_aux
 mediapipe
+
+# InstantID face identity
+# NOTE: insightface antelopev2 model weights are NON-COMMERCIAL
+# (research use) — see config.py header.
+insightface
+onnxruntime
+

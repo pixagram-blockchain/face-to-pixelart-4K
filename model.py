@@ -1,22 +1,23 @@
 """
 Model loading for Pixagram Pixel Art Generator
-With Prompt-Based Face Preservation
+With InstantID Face Identity (IdentityNet + IP-Adapter)
 
 This module loads:
-1. SDXL Pipeline with ControlNet
-2. Pixel Art LoRA
-3. Face Attribute Analyzer (OpenCV + MediaPipe, no InsightFace)
+1. SDXL Pipeline (InstantID img2img variant) with MultiControlNet
+   [IdentityNet, Zoe Depth] from the single-file checkpoint
+2. The InstantID IP-Adapter (identity embedding -> UNet cross-attention)
+3. Pixel Art LoRA (unfused PEFT adapter, live per-request scale)
+4. insightface antelopev2 (SCRFD detection + ArcFace embeddings + kps)
+
+LICENSE NOTE: insightface antelopev2 model weights are released for
+NON-COMMERCIAL research use (InstantID code itself is Apache-2.0).
 """
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from PIL import Image
-from diffusers import (
-    StableDiffusionXLControlNetImg2ImgPipeline,
-    ControlNetModel,
-    LCMScheduler
-)
+from diffusers import ControlNetModel, LCMScheduler
 
 # ---- mediapipe shim ------------------------------------------------
 # controlnet_aux unconditionally imports mp.solutions.drawing_utils in
@@ -39,17 +40,9 @@ def _patch_mediapipe_solutions():
     if hasattr(mp, "solutions"):
         return                       # old mediapipe — no patch needed
 
-    # A stub module that returns a no-op for any attribute access.
-    # This lets controlnet_aux do things like:
-    #   mp_drawing = mp.solutions.drawing_utils
-    #   FACEMESH_TESSELATION = mp.solutions.face_mesh.FACEMESH_TESSELATION
-    # without crashing.  None of these are ever actually *called* since
-    # we never use MediapipeFaceDetector at runtime.
     class _StubModule(types.ModuleType):
         def __init__(self, name):
             super().__init__(name)
-            # Explicit metadata so sys.modules iteration never gets a
-            # stub where it expects str/None (Gradio reload, importlib).
             self.__file__ = None
             self.__path__ = []
             self.__spec__ = None
@@ -92,10 +85,12 @@ _patch_mediapipe_solutions()
 # ---- end shim ------------------------------------------------------
 
 from controlnet_aux import ZoeDetector
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, snapshot_download
 from config import Config
-from faceid import FaceAnalyzer
 from utils import preload_captioner
+from pipeline_stable_diffusion_xl_instantid_img2img import (
+    StableDiffusionXLInstantIDImg2ImgPipeline,
+)
 
 
 class ModelHandler:
@@ -103,25 +98,26 @@ class ModelHandler:
     Handles loading and management of all models.
 
     Components:
-    - SDXL Pipeline with ControlNet
+    - SDXL InstantID img2img Pipeline with MultiControlNet [identity, depth]
+    - InstantID IP-Adapter
     - Zoe Depth Detector
-    - LoRA Weights
-    - Face Attribute Analyzer (Commercial)
+    - LoRA Weights (unfused PEFT adapter)
+    - insightface antelopev2 FaceAnalysis (detection + kps + embeddings)
     """
 
     def __init__(self):
         self.pipeline = None
         self.zoe_detector = None
-        self.face_analyzer = None
+        self.face_app = None
 
     def load_models(self):
         print("=" * 60)
         print("Loading Pixagram Pixel Art Models")
-        print("  (Prompt-Based Face Preservation)")
+        print("  (InstantID face identity: IdentityNet + IP-Adapter)")
         print("=" * 60)
 
         # 1. Load Zoe Depth Detector
-        print("\n[1/4] Loading Zoe Depth Detector...")
+        print("\n[1/5] Loading Zoe Depth Detector...")
         try:
             self.zoe_detector = ZoeDetector.from_pretrained(Config.ANNOTATOR_REPO)
             self.zoe_detector.to(Config.DEVICE)
@@ -130,39 +126,59 @@ class ModelHandler:
             print(f"  [ERROR] Failed to load ZoeDetector: {e}")
             raise
 
-        # 2. Load ControlNets: Depth (structure/pose) + Canny (face lock)
-        print("\n[2/4] Loading ControlNets (Zoe Depth + Canny)...")
+        # 2. Load ControlNets: IdentityNet (face identity/structure) + Depth
+        print("\n[2/5] Loading ControlNets (InstantID IdentityNet + Zoe Depth)...")
+        identity_controlnet = ControlNetModel.from_pretrained(
+            Config.INSTANTID_REPO,
+            subfolder="ControlNetModel",
+            torch_dtype=Config.DTYPE,
+        )
+        print("  [OK] IdentityNet loaded (InstantID face structure/identity)")
         depth_controlnet = ControlNetModel.from_pretrained(
             Config.CN_ZOE_REPO,
-            torch_dtype=Config.DTYPE
+            torch_dtype=Config.DTYPE,
         )
         print("  [OK] ControlNet Depth loaded")
-        canny_controlnet = ControlNetModel.from_pretrained(
-            Config.CN_CANNY_REPO,
-            torch_dtype=Config.DTYPE
-        )
-        print("  [OK] ControlNet Canny loaded (face structure lock)")
 
-        # IMPORTANT: order is [depth, canny] and MUST match the order of
+        # IMPORTANT: order is [identity, depth] and MUST match the order of
         # the control-image list and conditioning-scale list passed by
         # generator.py / tiled_pipeline.py.
-        controlnets = [depth_controlnet, canny_controlnet]
+        controlnets = [identity_controlnet, depth_controlnet]
 
         # 3. Load Base Pipeline with checkpoint
-        print("\n[3/4] Loading SDXL Pipeline...")
+        print("\n[3/5] Loading SDXL InstantID Pipeline...")
         checkpoint_path = hf_hub_download(
             repo_id=Config.REPO_ID,
             filename=Config.CHECKPOINT_FILENAME
         )
         print(f"  [OK] Checkpoint downloaded: {Config.CHECKPOINT_FILENAME}")
 
-        self.pipeline = StableDiffusionXLControlNetImg2ImgPipeline.from_single_file(
+        self.pipeline = StableDiffusionXLInstantIDImg2ImgPipeline.from_single_file(
             checkpoint_path,
             controlnet=controlnets,
             torch_dtype=Config.DTYPE,
             use_safetensors=True
         )
-        print("  [OK] Pipeline loaded (MultiControlNet: depth + canny)")
+        print("  [OK] Pipeline loaded (MultiControlNet: identity + depth)")
+        print(
+            f"  [INFO] VAE in use: force_upcast="
+            f"{getattr(self.pipeline.vae.config, 'force_upcast', None)} "
+            f"dtype={self.pipeline.vae.dtype}"
+        )
+
+        # InstantID IP-Adapter: projects the ArcFace embedding into
+        # UNet cross-attention tokens (the likeness component).
+        print("\n  Loading InstantID IP-Adapter...")
+        ip_adapter_path = hf_hub_download(
+            repo_id=Config.INSTANTID_REPO,
+            filename="ip-adapter.bin",
+        )
+        self.pipeline.load_ip_adapter_instantid(ip_adapter_path)
+        self.pipeline.set_ip_adapter_scale(Config.DEFAULT_IP_ADAPTER_SCALE)
+        print(
+            f"  [OK] IP-Adapter loaded (default scale "
+            f"{Config.DEFAULT_IP_ADAPTER_SCALE})"
+        )
 
         # Load LoRA
         print("\n  Loading LoRA weights...")
@@ -171,12 +187,12 @@ class ModelHandler:
             filename=Config.LORA_FILENAME
         )
         self.pipeline.load_lora_weights(lora_path, adapter_name="retroart")
-        # IMPORTANT: do NOT fuse. Fusing bakes a single fixed scale (1.25)
-        # into the UNet, which made the style far too strong — over-cooking
-        # non-portraits and over-stylising faces, with no way to differentiate.
-        # Keeping it as a live PEFT adapter lets generator.py set the style
-        # strength per request via set_adapters(). We seed a sensible default
-        # here; generator overrides it each call.
+        # IMPORTANT: do NOT fuse. Fusing bakes a single fixed scale into the
+        # UNet with no per-request differentiation. Keeping it as a live PEFT
+        # adapter lets generator.py set the style strength per request via
+        # set_adapters(). PEFT wraps the attention Linear layers, so it
+        # coexists cleanly with the InstantID IPAttnProcessors (which call
+        # those same wrapped Linears).
         self.pipeline.set_adapters(
             ["retroart"], adapter_weights=[Config.DEFAULT_LORA_INTENSITY]
         )
@@ -197,51 +213,72 @@ class ModelHandler:
         self.pipeline.to(Config.DEVICE)
         self.pipeline.enable_vae_slicing()
         self.pipeline.enable_vae_tiling()
-        self.pipeline.enable_attention_slicing()
+        # NOTE: xformers and attention slicing are deliberately NOT enabled.
+        # enable_xformers_memory_efficient_attention() REPLACES the UNet's
+        # attention processors — which would silently rip out the InstantID
+        # IPAttnProcessors installed by load_ip_adapter_instantid() and kill
+        # identity injection. VAE slicing/tiling above don't touch the UNet.
 
-        if Config.DEVICE == "cuda":
-            try:
-                self.pipeline.enable_xformers_memory_efficient_attention()
-                print("  [OK] xformers enabled")
-            except Exception as e:
-                print(f"  [INFO] xformers not available: {e}")
-
-        # 4. Load Face Attribute Analyzer
-        # Lightweight: just OpenCV + MediaPipe, no GPU models
-        print("\n[4/4] Loading Face Attribute Analyzer...")
+        # 4. Load insightface antelopev2 (detection + kps + embeddings)
+        print("\n[4/5] Loading insightface antelopev2...")
         try:
-            self.face_analyzer = FaceAnalyzer(
-                min_confidence=Config.FACE_DETECTION_CONFIDENCE
-            )
-            print("  [OK] Face Analyzer loaded")
-            print("       - Face Detection: OpenCV/MediaPipe (BSD/Apache 2.0)")
-            print("       - Attribute Analysis: MediaPipe FaceMesh (Apache 2.0)")
-            print("       - Color Analysis: OpenCV (BSD)")
-        except Exception as e:
-            print(f"  [WARN] Face Analyzer failed to load: {e}")
-            print("         Face preservation will be disabled.")
-            self.face_analyzer = None
+            from insightface.app import FaceAnalysis
 
-        # Preload BLIP captioner
-        print("\nPreloading captioner...")
-        preload_captioner()
+            snapshot_download(
+                repo_id=Config.ANTELOPE_REPO,
+                local_dir=os.path.join(
+                    Config.INSIGHTFACE_ROOT, "models", "antelopev2"
+                ),
+            )
+            self.face_app = FaceAnalysis(
+                name="antelopev2",
+                root=Config.INSIGHTFACE_ROOT,
+                providers=["CPUExecutionProvider"],
+            )
+            self.face_app.prepare(ctx_id=0, det_size=(640, 640))
+            print("  [OK] antelopev2 ready (SCRFD det + ArcFace embeddings)")
+            print("       LICENSE: non-commercial research use (InsightFace)")
+        except Exception as e:
+            print(f"  [WARN] insightface failed to load: {e}")
+            print("         InstantID identity will be disabled (style-only).")
+            self.face_app = None
+
+        # 5. Optional BLIP captioner. OFF by default (Config.USE_CAPTION):
+        # the caption was the main source of phantom faces; skipping it also
+        # avoids a ~1GB download on startup.
+        if Config.USE_CAPTION:
+            print("\n[5/5] Preloading captioner...")
+            preload_captioner()
+        else:
+            print(
+                "\n[5/5] BLIP captioning disabled (USE_CAPTION=False) — "
+                "generation uses trigger word(s) only."
+            )
 
         print("\n" + "=" * 60)
         print("Model loading complete!")
         print("  - Pixel Art Style: ✓")
         print("  - Depth Control: ✓")
-        print("  - Face Attributes: ✓" if self.face_analyzer else "  - Face Attributes: ✗")
-        print("  - License: All commercial-friendly")
+        print("  - InstantID Identity: ✓" if self.face_app else "  - InstantID Identity: ✗ (no insightface)")
+        print("  - NOTE: antelopev2 weights are non-commercial (InsightFace)")
         print("=" * 60 + "\n")
 
     def check_face(self, image) -> bool:
         """Check if image contains a detectable face."""
-        if self.face_analyzer is None:
+        if self.face_app is None:
             return False
-        return self.face_analyzer.has_face(image)
+        try:
+            import cv2
+            import numpy as np
+            bgr = cv2.cvtColor(
+                np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR
+            )
+            return len(self.face_app.get(bgr)) > 0
+        except Exception:
+            return False
 
 
-print("[OK] Model handler ready (prompt-based face preservation)")
+print("[OK] Model handler ready (InstantID face identity)")
 
 # Module-level cached handler so get_pipeline() can return it after preload
 _handler: ModelHandler | None = None
@@ -278,9 +315,9 @@ def get_zoe_detector():
     return _handler.zoe_detector
 
 
-def get_face_analyzer():
-    """Return the loaded FaceAnalyzer (or None if unavailable)."""
+def get_face_app():
+    """Return the insightface FaceAnalysis app (or None if unavailable)."""
     global _handler
     if _handler is None:
         preload_pipeline()
-    return _handler.face_analyzer
+    return _handler.face_app
