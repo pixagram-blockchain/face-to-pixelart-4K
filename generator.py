@@ -59,9 +59,8 @@ from config import (
     FACE_BOX_DILATE,
     AUTO_FACEID,
     USE_CAPTION,
-    STYLE_TRIGGER1,
-    STYLE_TRIGGER2,
-    TRIGGER_WORD,
+    LORA_STYLES,
+    DEFAULT_LORA_STYLE,
     MAX_RESOLUTION,
     DEFAULT_RESOLUTION,
     DEFAULT_LORA_INTENSITY,
@@ -74,8 +73,17 @@ from config import (
     IMG_STRENGTH_MAX,
     FACE_NEGATIVE_ADDON,
     SOLO_PROMPT_ADDON,
+    BG_POSITIVE_ADDON,
     FACE_GUIDANCE_MIN,
+    NOFACE_GUIDANCE_MIN,
     PHANTOM_FACE_MAX_RETRIES,
+    PHANTOM_DET_LONG_EDGE,
+    PHANTOM_REPAIR,
+    PHANTOM_REPAIR_DILATE,
+    PHANTOM_RUNG_CHECK,
+    PHANTOM_BODY_CHECK,
+    PHANTOM_BODY_MIN_SCORE,
+    TXT2IMG_ROUTING_MIN_SCORE,
     ASPECT_RATIOS,
     DEFAULT_ASPECT_RATIO,
     TXT2IMG_STRENGTH,
@@ -85,6 +93,7 @@ from config import (
     TWO_PASS_REFINE,
     BASE_PASS_LONG_EDGE,
     REFINE_STRENGTH,
+    REFINE_NOFACE_MULTIPLIER,
     COLOR_MATCH,
     COLOR_MATCH_STRENGTH,
     COLOR_MATCH_REFERENCE,
@@ -92,8 +101,12 @@ from config import (
     USE_ESCALATION,
     ESCALATION_FACTOR,
     ESCALATION_MAX_STEPS,
+    CONTROL_GUIDANCE_START,
+    CONTROL_GUIDANCE_END,
+    TILE_BG_ZERO_IDENTITY,
+    TILE_BATCH_SIZE,
 )
-from model import get_pipeline, get_zoe_detector, get_face_app
+from model import get_pipeline, get_zoe_detector, get_face_app, get_loaded_lora_styles
 from utils import create_seed, match_colors_lab
 from tiled_pipeline import tiled_controlnet_img2img
 from pipeline_stable_diffusion_xl_instantid_img2img import draw_kps
@@ -101,16 +114,18 @@ from pipeline_stable_diffusion_xl_instantid_img2img import draw_kps
 
 # "portrait" baits SDXL into generating faces. Only include it when we
 # have CONFIRMED a face exists in the input.
-def _style_trigger(has_face: bool) -> str:
-    """Return the LoRA trigger string, with the 'portrait' token added
-    only when a face has been confirmed in the input."""
+def _style_trigger(has_face: bool, lora_style: str = DEFAULT_LORA_STYLE) -> str:
+    """Return the trigger string for the selected LoRA style, with the
+    'portrait' token kept only when a face has been confirmed in the input."""
+    spec = LORA_STYLES.get(lora_style, LORA_STYLES[DEFAULT_LORA_STYLE])
     if has_face:
-        return TRIGGER_WORD  # full string includes "retro game art portrait"
+        # Full verbatim trigger — includes "retro game art portrait".
+        return spec["trigger1"] + ", " + spec["trigger2"]
     # Strip the portrait bait for non-face content: drop the "portrait"
     # token from the second trigger ("retro game art portrait" ->
     # "retro game art"). The first trigger already establishes the style.
-    safe_trigger2 = STYLE_TRIGGER2.replace(" portrait", "")
-    return STYLE_TRIGGER1 + ", " + safe_trigger2
+    safe_trigger2 = spec["trigger2"].replace(" portrait", "")
+    return spec["trigger1"] + ", " + safe_trigger2
 
 
 # Nouns/pronouns that bait SDXL's portrait-biased LoRA into synthesizing a
@@ -132,6 +147,13 @@ _PERSON_TOKENS = {
     # apostrophe-collapsed possessives: after stripping non-alpha chars
     # "woman's" -> "womans", "man's" -> "mans", etc. Catch those too.
     "mans", "womans", "womens", "mens", "peoples", "childs", "ladys", "babys",
+    # Body parts and figure nouns — the LoRA doesn't need a whole person
+    # to be asked for; "hands", "a figure", "silhouettes" invite limbs and
+    # humanoids just as reliably as "man" invites a face. ("body" stays
+    # out: "body of water" is a legitimate landscape phrase.)
+    "figure", "figures", "silhouette", "silhouettes", "hand", "hands",
+    "arm", "arms", "leg", "legs", "limb", "limbs", "torso", "torsos",
+    "bodies", "character", "characters", "sprite", "sprites",
 }
 
 
@@ -195,6 +217,224 @@ def _faces_to_bboxes(faces: List) -> List[Tuple[int, int, int, int]]:
     ]
 
 
+def _detect_faces_scaled(
+    image: Image.Image,
+    min_score: float,
+    det_long_edge: int = PHANTOM_DET_LONG_EDGE,
+) -> List[Tuple[int, int, int, int]]:
+    """
+    Face detection sized for the DETECTOR, not the canvas. insightface
+    squeezes its input to det_size (640x640) internally, so on a 4K
+    output a face shrinks to a dozen pixels and detection silently fails
+    — the phantom guard couldn't SEE the phantoms it was guarding
+    against. Detect on a copy resized to `det_long_edge` on the long
+    side, then scale the boxes back to the original coordinates.
+    """
+    w, h = image.size
+    long_edge = max(w, h)
+    if long_edge > det_long_edge:
+        s = det_long_edge / float(long_edge)
+        det_img = image.resize(
+            (max(1, int(round(w * s))), max(1, int(round(h * s)))),
+            Image.LANCZOS,
+        )
+    else:
+        s = 1.0
+        det_img = image
+    boxes = _faces_to_bboxes(
+        _detect_faces_insight(det_img, min_score=min_score)
+    )
+    if s != 1.0 and boxes:
+        inv = 1.0 / s
+        boxes = [tuple(int(round(v * inv)) for v in b) for b in boxes]
+    return boxes
+
+
+def _find_phantom_bboxes(
+    output_image: Image.Image,
+    legit_bboxes: Optional[List[Tuple[int, int, int, int]]],
+    min_score: float = PHANTOM_FACE_MIN_SCORE,
+) -> List[Tuple[int, int, int, int]]:
+    """
+    Faces in the output whose center lies in NO legit (expanded input)
+    box — POSITIONAL phantom matching. The old raw-count comparison was
+    fooled by "one phantom appeared while the real face slipped under the
+    score bar" (counts equal); a positional match catches that, and never
+    flags a legit face that merely shifted a little (the expanded boxes
+    provide the slack). The score bar stays above the input gate: SCRFD
+    can hallucinate on stylised textures, and phantom faces tend to be
+    the realistic ones it does catch.
+    """
+    legit = legit_bboxes or []
+    phantoms: List[Tuple[int, int, int, int]] = []
+    for (x1, y1, x2, y2) in _detect_faces_scaled(output_image, min_score):
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        if not any(
+            lx1 <= cx < lx2 and ly1 <= cy < ly2
+            for (lx1, ly1, lx2, ly2) in legit
+        ):
+            phantoms.append((x1, y1, x2, y2))
+    return phantoms
+
+
+def _erase_phantoms(
+    image: Image.Image,
+    reference: Image.Image,
+    phantom_bboxes: List[Tuple[int, int, int, int]],
+    dilate_frac: float = PHANTOM_REPAIR_DILATE,
+) -> Image.Image:
+    """
+    Feather-paste the phantom-free `reference` (the coherent base pass,
+    upscaled) over each phantom region — a soft ellipse with a
+    size-scaled blur, the same technique as the depth-boost mask, so no
+    seam shows. Deterministic and LOCAL: unlike a seed re-roll it costs
+    seconds, cannot phantom again (the pasted pixels come from a
+    single-pass image), and cannot make anything worse elsewhere.
+    """
+    if not phantom_bboxes:
+        return image
+    out = np.asarray(image.convert("RGB"), dtype=np.float32)
+    ref = np.asarray(
+        reference.convert("RGB").resize(image.size, Image.LANCZOS),
+        dtype=np.float32,
+    )
+    h, w = out.shape[:2]
+    mask = np.zeros((h, w), dtype=np.float32)
+    max_feather = 15
+    for (x1, y1, x2, y2) in phantom_bboxes:
+        fw = max(1, int(x2) - int(x1))
+        fh = max(1, int(y2) - int(y1))
+        cx, cy = (int(x1) + int(x2)) // 2, (int(y1) + int(y2)) // 2
+        cv2.ellipse(
+            mask, (cx, cy),
+            (int(fw * (0.5 + dilate_frac)), int(fh * (0.5 + dilate_frac))),
+            0, 0, 360, 1.0, thickness=-1,
+        )
+        max_feather = max(max_feather, int(round(0.45 * min(fw, fh))))
+    mask = np.array(
+        Image.fromarray((mask * 255).astype(np.uint8))
+        .filter(ImageFilter.GaussianBlur(radius=max_feather))
+    ).astype(np.float32) / 255.0
+    blended = out * (1.0 - mask[:, :, None]) + ref * mask[:, :, None]
+    return Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8))
+
+
+_PERSON_DETECTOR = None
+_PERSON_DETECTOR_FAILED = False
+
+
+def _get_person_detector():
+    """
+    Lazy COCO person detector (torchvision Faster R-CNN MobileNetV3-FPN)
+    for the phantom BODY guard. Kept on CPU between calls and moved to
+    the GPU only for the detection itself, which plays nice with
+    ZeroGPU's on/off CUDA windows. Fail-soft: any import/load problem
+    disables the body channel for the session instead of breaking
+    generation.
+    """
+    global _PERSON_DETECTOR, _PERSON_DETECTOR_FAILED
+    if _PERSON_DETECTOR_FAILED:
+        return None
+    if _PERSON_DETECTOR is None:
+        try:
+            from torchvision.models.detection import (
+                FasterRCNN_MobileNet_V3_Large_FPN_Weights,
+                fasterrcnn_mobilenet_v3_large_fpn,
+            )
+            weights = FasterRCNN_MobileNet_V3_Large_FPN_Weights.DEFAULT
+            model = fasterrcnn_mobilenet_v3_large_fpn(weights=weights)
+            model.eval()
+            _PERSON_DETECTOR = model
+            print("[Generator] Phantom body guard: person detector loaded")
+        except Exception as e:
+            _PERSON_DETECTOR_FAILED = True
+            print(f"[Generator] Body guard unavailable (non-fatal): {e}")
+            return None
+    return _PERSON_DETECTOR
+
+
+def _detect_persons_scaled(
+    image: Image.Image,
+    min_score: float = PHANTOM_BODY_MIN_SCORE,
+    det_long_edge: int = PHANTOM_DET_LONG_EDGE,
+) -> List[Tuple[int, int, int, int]]:
+    """
+    COCO "person" boxes in `image`, detected on a size-capped copy and
+    scaled back — the body-channel counterpart of _detect_faces_scaled.
+    Returns [] when the detector is unavailable or finds nothing.
+    """
+    model = _get_person_detector()
+    if model is None:
+        return []
+    w, h = image.size
+    long_edge = max(w, h)
+    if long_edge > det_long_edge:
+        s = det_long_edge / float(long_edge)
+        det_img = image.resize(
+            (max(1, int(round(w * s))), max(1, int(round(h * s)))),
+            Image.LANCZOS,
+        )
+    else:
+        s = 1.0
+        det_img = image
+    try:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        arr = np.asarray(det_img.convert("RGB"), dtype=np.float32) / 255.0
+        tensor = torch.from_numpy(arr).permute(2, 0, 1).to(device)
+        model.to(device)
+        with torch.inference_mode():
+            pred = model([tensor])[0]
+        model.to("cpu")
+        boxes: List[Tuple[int, int, int, int]] = []
+        inv = 1.0 / s
+        for box, label, score in zip(
+            pred["boxes"].cpu().tolist(),
+            pred["labels"].cpu().tolist(),
+            pred["scores"].cpu().tolist(),
+        ):
+            if int(label) == 1 and float(score) >= min_score:  # COCO person
+                boxes.append(tuple(int(round(v * inv)) for v in box))
+        return boxes
+    except Exception as e:
+        print(f"[Generator] Person detection failed (non-fatal): {e}")
+        try:
+            model.to("cpu")
+        except Exception:
+            pass
+        return []
+
+
+def _boxes_intersect(
+    a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]
+) -> bool:
+    """True when two (x1, y1, x2, y2) boxes overlap at all."""
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def _find_phantom_person_bboxes(
+    output_image: Image.Image,
+    legit_boxes: Optional[List[Tuple[int, int, int, int]]],
+    min_score: float = PHANTOM_BODY_MIN_SCORE,
+) -> List[Tuple[int, int, int, int]]:
+    """
+    Person boxes in the output that touch NO legit region. Legit regions
+    are person boxes detected in the INPUT photo plus the expanded input
+    face boxes (a subject's body box always overlaps their own face box),
+    so the subject and any real bystander survive; a figure invented on a
+    cliff face does not. INTERSECTION (not center-in-box) is the right
+    test here: a person box is tall, and its center can sit well below a
+    face-only legit box.
+    """
+    if not PHANTOM_BODY_CHECK:
+        return []
+    legit = legit_boxes or []
+    phantoms: List[Tuple[int, int, int, int]] = []
+    for box in _detect_persons_scaled(output_image, min_score):
+        if not any(_boxes_intersect(box, lb) for lb in legit):
+            phantoms.append(box)
+    return phantoms
+
+
 def _insight_prompt_enrichment(face) -> str:
     """
     Coarse face descriptors from insightface's genderage head — used only
@@ -249,6 +489,7 @@ def _build_prompts(
     preserve_identity: bool = False,
     primary_face=None,
     allow_face_attributes: bool = True,
+    lora_style: str = DEFAULT_LORA_STYLE,
 ) -> Tuple[str, str]:
     """
     Build the main generation prompt and a face-free "background" prompt
@@ -274,15 +515,16 @@ def _build_prompts(
          leaking into several tiles re-introduces duplicates.
       4. User-supplied additional style instructions (last, so they win).
 
-    The background prompt is the face-free variant (style trigger + user
-    extra, plus the scrubbed caption when captioning is on). In tiled mode
+    The background prompt is the face-free variant (style trigger +
+    person-scrubbed user extra, plus the scrubbed caption when captioning
+    is on). In tiled mode
     it conditions every tile that does NOT own a face, so the
     portrait-biased LoRA can't grow a face on background tiles.
 
     Returns:
         (main_prompt, bg_prompt)
     """
-    parts = [_style_trigger(face_confirmed)]
+    parts = [_style_trigger(face_confirmed, lora_style)]
 
     if face_confirmed and face_count == 1 and SOLO_PROMPT_ADDON:
         parts.append(SOLO_PROMPT_ADDON)
@@ -335,12 +577,23 @@ def _build_prompts(
     main_prompt = ", ".join(parts)
 
     # Background prompt: face-free style trigger (+ scrubbed caption if
-    # captioning is on) + user extra. No "portrait", no attributes.
-    bg_parts = [_style_trigger(False)]
+    # captioning is on) + SCRUBBED user extra. No "portrait", no
+    # attributes — and no person nouns from the user either: positive
+    # tokens act even at CFG 1.0, so "portrait of a knight" typed into
+    # the extra prompt used to order EVERY background tile to draw a face,
+    # and no negative could stop it. (The txt2img path already scrubbed
+    # its extra; this makes img2img consistent.)
+    bg_parts = [_style_trigger(False, lora_style)]
     if scrubbed_caption:
         bg_parts.append(scrubbed_caption)
     if extra:
-        bg_parts.append(extra)
+        safe_extra = _scrub_person_tokens(extra)
+        if safe_extra:
+            bg_parts.append(safe_extra)
+    if BG_POSITIVE_ADDON:
+        # Positive scenery bias: the only anti-figure lever that still
+        # works at CFG 1.0, where every negative below is ignored.
+        bg_parts.append(BG_POSITIVE_ADDON)
     bg_prompt = ", ".join(bg_parts)
 
     return main_prompt, bg_prompt
@@ -416,7 +669,11 @@ def _expand_bboxes(
     """
     Expand each (x1, y1, x2, y2) bbox by `frac` of its own size per edge,
     clamped to the image bounds. Used by the tiled regional-prompt routing
-    so a face straddling a tile edge is still owned by the right tile.
+    and by the phantom guard's legit-face test (slack for small positional
+    drift of a real face in the output). Note: symmetric expansion leaves
+    the box CENTER unchanged except at canvas borders, so it does not
+    affect center-in-tile ownership — that robustness comes from the tile
+    overlap itself, under which a center near a seam lies in both tiles.
     """
     out: List[Tuple[int, int, int, int]] = []
     for (x1, y1, x2, y2) in face_bboxes:
@@ -554,7 +811,11 @@ def _coarse_to_fine(
     image_embeds,
     ip_adapter_scale: float,
     detect_faces_on_base: bool = False,
-) -> Image.Image:
+    phantom_rung_check: bool = False,
+    phantom_legit_person_bboxes: Optional[
+        List[Tuple[int, int, int, int]]
+    ] = None,
+) -> Tuple[Image.Image, Image.Image]:
     """
     Coarse-to-fine high-res generation — the "best of both worlds".
 
@@ -594,7 +855,20 @@ def _coarse_to_fine(
     for it). When True and no face_bboxes_px were given, faces are detected
     on the base result and used for the refine rungs' regional routing —
     so the prompted portrait keeps its face tile while background tiles get
-    the face-free bg_prompt.
+    the face-free bg_prompt. When detection still finds nothing, the
+    refine rungs fall back to the face-free bg_prompt for EVERY tile: the
+    content is already baked into the base and travels through the init
+    latents, so no tile needs the person nouns.
+
+    phantom_rung_check: when True, each refine rung is scanned for phantom
+    faces AND phantom person figures (positional match against
+    face_bboxes_px / phantom_legit_person_bboxes) and any phantom is
+    immediately erased from that rung's coherent base reference — catching
+    a proto-face or proto-figure at the first rung is far cheaper than at
+    the target resolution and stops it compounding up the ladder.
+
+    Returns (refined_image, base_pass_image): the base is returned so the
+    caller's phantom guard can repair from it instead of re-rolling.
     """
     # ---- Base size: preserve aspect, cap long edge at base_long, mult of 8.
     long_edge = max(target_w, target_h)
@@ -623,6 +897,8 @@ def _coarse_to_fine(
             num_inference_steps=num_inference_steps,
             strength=base_strength,
             controlnet_conditioning_scale=list(control_scales),
+            control_guidance_start=list(CONTROL_GUIDANCE_START),
+            control_guidance_end=list(CONTROL_GUIDANCE_END),
             clip_skip=clip_skip,
             generator=g_base,
             width=base_w,
@@ -638,6 +914,22 @@ def _coarse_to_fine(
     if detect_faces_on_base and not face_bboxes_px and bg_prompt:
         try:
             base_faces = _detect_faces_insight(base_out)
+            if not base_faces:
+                # SCRFD is photo-trained: a chunky pixel-art face on the
+                # small stylised base often scores under
+                # FACE_DET_SCORE_MIN. Retry at a lenient ROUTING-ONLY bar
+                # — misrouting a tile to "face" merely keeps the main
+                # prompt there (cheap); a miss used to broadcast the
+                # portrait prompt to every refine tile (the phantom
+                # factory).
+                base_faces = _detect_faces_insight(
+                    base_out, min_score=TXT2IMG_ROUTING_MIN_SCORE
+                )
+                if base_faces:
+                    print(
+                        "[CoarseToFine] base face(s) found only at the "
+                        f"lenient routing bar ({TXT2IMG_ROUTING_MIN_SCORE:.2f})"
+                    )
             if base_faces:
                 bboxes = _expand_bboxes(
                     _faces_to_bboxes(base_faces), FACE_BOX_DILATE, base_w, base_h
@@ -651,6 +943,22 @@ def _coarse_to_fine(
                 )
         except Exception as e:
             print(f"[CoarseToFine] base face detection failed (non-fatal): {e}")
+        if not face_bboxes_px:
+            # No face located (or detection unavailable). The content —
+            # faces included, if the prompt asked for any — is already
+            # BAKED into the coherent base, and at refine strength the
+            # tiles keep it through their init latents: they don't need
+            # the person nouns. So refine EVERY tile with the face-free
+            # background prompt instead of broadcasting
+            # "portrait, <user nouns>" to the whole grid. Guidance is 1.0
+            # in txt2img, so the bg negatives stay inert and cannot attack
+            # a face the detector merely missed.
+            print(
+                "[CoarseToFine] no face located on the base — refining all "
+                "tiles with the face-free background prompt"
+            )
+            prompt = bg_prompt
+            negative_prompt = bg_negative_prompt or negative_prompt
 
     # ---- Resolution rungs ----
     # Without escalation: a single rung at the target -> base is upscaled to
@@ -705,12 +1013,42 @@ def _coarse_to_fine(
             # InstantID per-tile routing: identity only on face tiles.
             image_embeds=image_embeds,
             ip_adapter_scale=ip_adapter_scale,
+            control_guidance_start=list(CONTROL_GUIDANCE_START),
+            control_guidance_end=list(CONTROL_GUIDANCE_END),
+            # Skip the IdentityNet entirely on background tiles (their kps
+            # crop is black anyway); pairs with the pipeline's zero-scale
+            # skip. See Config.TILE_BG_ZERO_IDENTITY.
+            bg_zero_control_indices=[0] if TILE_BG_ZERO_IDENTITY else None,
+            tile_batch_size=TILE_BATCH_SIZE,
         )
         torch.cuda.empty_cache()
         print(
             f"[CoarseToFine] refine rung {ri}/{n_rungs} @ {rw}x{rh} "
             f"(strength {refine_strength:.2f})"
         )
+        if phantom_rung_check:
+            # Catch proto-phantoms EARLY: a face or figure invented at
+            # rung k sits in rung k+1's init and gets sharpened up the
+            # whole ladder. Erasing it here — from this rung's own
+            # coherent reference — costs two capped-size detection passes
+            # and a local paste.
+            legit_r = _scale_bboxes(
+                face_bboxes_px, target_w, target_h, rw, rh
+            ) or []
+            rung_phantoms = _find_phantom_bboxes(current, legit_r)
+            legit_persons_r = _scale_bboxes(
+                phantom_legit_person_bboxes, target_w, target_h, rw, rh
+            ) or []
+            rung_phantoms += _find_phantom_person_bboxes(
+                current, legit_persons_r + legit_r
+            )
+            if rung_phantoms:
+                print(
+                    f"[CoarseToFine] rung {ri}: erasing "
+                    f"{len(rung_phantoms)} phantom region(s) from the "
+                    "base reference"
+                )
+                current = _erase_phantoms(current, ref_r, rung_phantoms)
 
     refined = current
 
@@ -726,7 +1064,7 @@ def _coarse_to_fine(
             f"(strength {COLOR_MATCH_STRENGTH:.2f})"
         )
 
-    return refined
+    return refined, base_out
 
 
 def generate_pixel_art(
@@ -736,6 +1074,7 @@ def generate_pixel_art(
     num_inference_steps: int = DEFAULT_NUM_INFERENCE_STEPS,
     seed: int = -1,
     lora_intensity: float = DEFAULT_LORA_INTENSITY,
+    lora_style: str = DEFAULT_LORA_STYLE,
     img2img_strength: float = IMG_STRENGTH,
     identity_preserve: bool = DEFAULT_FACE_PRESERVE_ENABLED,
     identitynet_strength: float = DEFAULT_IDENTITYNET_SCALE,
@@ -782,6 +1121,10 @@ def generate_pixel_art(
         guidance_scale: Guidance scale for generation.
         num_inference_steps: Number of inference steps.
         seed: Random seed (-1 for random).
+        lora_style: Which pixel-art LoRA to use — a key of
+                    Config.LORA_STYLES ("retroart" or "vga"). Selects both
+                    the adapter weights and the matching trigger prompt
+                    (retroart / dosvga).
         identity_preserve: Enable InstantID identity conditioning (img2img).
         identitynet_strength: IdentityNet ControlNet conditioning scale
                               (facial structure/pose; 0-1.5).
@@ -803,6 +1146,23 @@ def generate_pixel_art(
     """
     is_txt2img = input_image is None
     extra_prompt = (additional_prompt or "").strip()
+
+    # ---- LoRA style validation -----------------------------------------
+    if lora_style not in LORA_STYLES:
+        raise ValueError(
+            f"Unknown LoRA style '{lora_style}' — choose one of "
+            f"{list(LORA_STYLES)}."
+        )
+    try:
+        loaded_styles = get_loaded_lora_styles()
+    except Exception:
+        loaded_styles = None  # never block generation on the introspection
+    if loaded_styles is not None and lora_style not in loaded_styles:
+        raise ValueError(
+            f"LoRA style '{lora_style}' failed to load at startup — is "
+            f"'{LORA_STYLES[lora_style]['weight_name']}' present in the "
+            f"weights repo? Loaded styles: {loaded_styles}."
+        )
 
     if is_txt2img and not extra_prompt:
         raise ValueError(
@@ -890,16 +1250,18 @@ def generate_pixel_art(
         # The user's (mandatory) prompt defines the content, so it gets the
         # FULL trigger — including the LoRA token — and NO face gating: if
         # the user asks for a person, nothing should fight it.
-        prompt = ", ".join([TRIGGER_WORD, extra_prompt])
+        prompt = ", ".join([_style_trigger(True, lora_style), extra_prompt])
         negative_prompt = DEFAULT_NEGATIVE_PROMPT
         # Face-free variant for background tiles in the tiled refine: the
         # base pass may legitimately generate a face (the prompt asked for
         # one), but no OTHER tile should be told to draw a person too —
         # person nouns are scrubbed from the user's prompt for those tiles.
-        bg_parts = [_style_trigger(False)]
+        bg_parts = [_style_trigger(False, lora_style)]
         scrubbed_extra = _scrub_person_tokens(extra_prompt)
         if scrubbed_extra:
             bg_parts.append(scrubbed_extra)
+        if BG_POSITIVE_ADDON:
+            bg_parts.append(BG_POSITIVE_ADDON)
         bg_prompt = ", ".join(bg_parts)
         bg_negative_prompt = DEFAULT_NEGATIVE_PROMPT + ", " + NOFACE_NEGATIVE_ADDON
     else:
@@ -916,6 +1278,7 @@ def generate_pixel_art(
             preserve_identity=identity_preserve,
             primary_face=primary_face,
             allow_face_attributes=not use_tiled,
+            lora_style=lora_style,
         )
 
         # Negative prompts.
@@ -925,8 +1288,8 @@ def generate_pixel_art(
         #     single-face inputs so it never fights legitimate group photos.
         #   - background tiles (tiled mode): full face suppression — tiles
         #     outside every face box must not draw a person at all.
-        # These are weak at LCM CFG ~1.2, which is why guidance is floored
-        # below for face jobs.
+        # These are INERT at the default guidance 1.0 (CFG off) — the
+        # guidance floor below re-enables CFG on face jobs so they can act.
         negative_prompt = DEFAULT_NEGATIVE_PROMPT
         if not face_confirmed:
             negative_prompt = DEFAULT_NEGATIVE_PROMPT + ", " + NOFACE_NEGATIVE_ADDON
@@ -944,15 +1307,36 @@ def generate_pixel_art(
     )
 
     # Guidance floor for face jobs (img2img only — face_confirmed is always
-    # False in txt2img): at the LCM default (1.2) the negative prompt is
-    # nearly inert, so the anti-duplication / face-suppression negatives
-    # need real CFG to act. LCM handles up to ~2.0 fine.
+    # False in txt2img): at the default 1.0 CFG is OFF and the negative
+    # prompt is ignored entirely, so the anti-duplication / face-suppression
+    # negatives need real CFG to act. Face jobs opt back into the 2x CFG
+    # cost deliberately; everything else stays single-batch at 1.0. LCM
+    # handles up to ~2.0 fine.
     effective_guidance = float(guidance_scale)
     if face_confirmed and FACE_GUIDANCE_MIN > 0 and effective_guidance < FACE_GUIDANCE_MIN:
         effective_guidance = float(FACE_GUIDANCE_MIN)
         print(
             f"[Generator] Guidance raised {guidance_scale} -> "
             f"{effective_guidance} (face job: negatives need CFG to bite)"
+        )
+    elif (
+        not face_confirmed
+        and not is_txt2img
+        and use_tiled
+        and NOFACE_GUIDANCE_MIN > 0
+        and effective_guidance < NOFACE_GUIDANCE_MIN
+    ):
+        # Faceless TILED job: without CFG the NOFACE_NEGATIVE_ADDON set
+        # above is a dead letter, and the refine rungs are exactly where
+        # the portrait-biased LoRA pareidolias texture into a face (each
+        # rung re-inits from the previous one, so a proto-face compounds).
+        # Single-pass faceless jobs stay at 1.0 — low strength + depth pin
+        # them well enough not to pay the ~1.8x CFG cost.
+        effective_guidance = float(NOFACE_GUIDANCE_MIN)
+        print(
+            f"[Generator] Guidance raised {guidance_scale} -> "
+            f"{effective_guidance} (no-face tiled job: NOFACE negatives "
+            "need CFG to bite)"
         )
 
     # Create seed. The torch.Generator object is created inside the
@@ -1036,20 +1420,39 @@ def generate_pixel_art(
     # unfused so we set the scale live per request.
     lora_scale = max(0.0, min(LORA_INTENSITY_MAX, float(lora_intensity) * lora_mult))
     try:
-        pipe.set_adapters(["retroart"], adapter_weights=[lora_scale])
+        pipe.set_adapters([lora_style], adapter_weights=[lora_scale])
         print(
-            f"[Generator] LoRA: base={lora_intensity} x {lora_mult} "
-            f"-> scale {lora_scale:.3f}"
+            f"[Generator] LoRA '{lora_style}': base={lora_intensity} "
+            f"x {lora_mult} -> scale {lora_scale:.3f}"
         )
     except Exception as e:
         print(f"[Generator] Could not set LoRA scale ({e}); using loaded default")
 
-    # Expanded face boxes drive the tiled regional-prompt routing: a face
-    # straddling a tile boundary is still assigned to the tile that owns
-    # its (expanded) center.
+    # Expanded face boxes serve the tiled regional-prompt routing AND the
+    # phantom guard's legit-face test (the slack absorbs small positional
+    # drift of a real face in the output). NOTE: symmetric expansion does
+    # not move a box's center (except when clamped at the canvas border),
+    # so it does not change WHICH tile owns a face — that robustness comes
+    # from the tile overlap itself, under which a center near a seam lies
+    # in both tiles.
     expanded_bboxes = _expand_bboxes(
         face_bboxes, FACE_BOX_DILATE, target_width, target_height
     )
+
+    # Legit PERSON regions for the body channel: persons detected in the
+    # input photo (catches real people whose face SCRFD never saw —
+    # turned away, distant, occluded) plus the expanded face boxes (the
+    # subject's body box always overlaps their own face box). Detected
+    # once per job; prepared-image coordinates == generation coordinates.
+    legit_person_boxes: List[Tuple[int, int, int, int]] = []
+    if PHANTOM_BODY_CHECK and not is_txt2img:
+        legit_person_boxes = _detect_persons_scaled(prepared_image)
+        if legit_person_boxes:
+            print(
+                f"[Generator] Body guard: {len(legit_person_boxes)} legit "
+                "person region(s) from the input"
+            )
+    legit_person_boxes = legit_person_boxes + expanded_bboxes
 
     # Free VRAM from preprocessing before the heavy diffusion step
     torch.cuda.empty_cache()
@@ -1061,25 +1464,45 @@ def generate_pixel_art(
     #     refine (escalation rungs) -> colour match.
     #   - tiled only: single-pass image-space tiled img2img.
     #   - neither: one standard pipeline call.
-    # In img2img mode this is wrapped in a phantom-face guard: if the output
-    # contains MORE high-confidence faces than the input, re-roll the seed
-    # and try again (the duplicate is a generation artifact, deterministic
-    # for a given seed). Each retry costs a full generation — keep
-    # PHANTOM_FACE_MAX_RETRIES small inside the ZeroGPU time window.
+    # In img2img mode this is wrapped in a phantom-face guard: output
+    # faces are matched POSITIONALLY against the (expanded) input face
+    # boxes, and any unmatched face is a phantom. Phantoms are first
+    # REPAIRED locally (feather-pasting the coherent base over them —
+    # coarse-to-fine path only); only when repair is unavailable or
+    # insufficient is the seed re-rolled and the job re-run. Each re-roll
+    # costs a full generation — keep PHANTOM_FACE_MAX_RETRIES small
+    # inside the ZeroGPU time window.
     # The guard is OFF in txt2img mode: there is no input face count to
     # compare against, and faces the user *prompted for* must never
     # trigger a re-roll.
     # ----------------------------------------------------------------
     input_face_count = len(face_bboxes)
-    guard_active = (not is_txt2img) and PHANTOM_FACE_MAX_RETRIES > 0
+    guard_active = (not is_txt2img) and (
+        PHANTOM_FACE_MAX_RETRIES > 0 or PHANTOM_REPAIR
+    )
     max_attempts = (1 + max(0, int(PHANTOM_FACE_MAX_RETRIES))) if guard_active else 1
     gen_notes: List[str] = []
 
     if hasattr(pipe, "set_ip_adapter_scale"):
         pipe.set_ip_adapter_scale(effective_ip_scale)
 
+    # Refine strength: faceless img2img jobs trim it — their base was
+    # deliberately conservative (IMG_NOFACE_MULTIPLIER halves the redraw),
+    # yet the rungs redrew at full REFINE_STRENGTH with no identity
+    # anchor, i.e. MORE aggressively than their own base. See Config.
+    effective_refine_strength = REFINE_STRENGTH * (
+        1.0 if (face_confirmed or is_txt2img) else REFINE_NOFACE_MULTIPLIER
+    )
+    if use_tiled and effective_refine_strength != REFINE_STRENGTH:
+        print(
+            f"[Generator] Refine strength {REFINE_STRENGTH} x "
+            f"{REFINE_NOFACE_MULTIPLIER} (no face) = "
+            f"{effective_refine_strength:.3f}"
+        )
+
     output_image = None
     for attempt in range(max_attempts):
+        base_pass_image = None  # coherent base of this attempt (coarse-to-fine only)
         generator = torch.Generator(device="cuda").manual_seed(actual_seed)
 
         if use_tiled and (TWO_PASS_REFINE or is_txt2img):
@@ -1089,7 +1512,7 @@ def generate_pixel_art(
             # txt2img ALWAYS takes this path when tiled: independent
             # high-strength tiles denoised from noise have no shared
             # content to agree on.
-            output_image = _coarse_to_fine(
+            output_image, base_pass_image = _coarse_to_fine(
                 pipe,
                 prepared_image=prepared_image,
                 control_images=control_images,
@@ -1106,7 +1529,7 @@ def generate_pixel_art(
                 num_inference_steps=num_inference_steps,
                 guidance_scale=effective_guidance,
                 base_strength=img_strength,
-                refine_strength=REFINE_STRENGTH,
+                refine_strength=effective_refine_strength,
                 base_long=BASE_PASS_LONG_EDGE,
                 tile_size=tile_size,
                 tile_overlap=tile_overlap,
@@ -1115,6 +1538,8 @@ def generate_pixel_art(
                 image_embeds=image_embeds,
                 ip_adapter_scale=effective_ip_scale,
                 detect_faces_on_base=is_txt2img,
+                phantom_rung_check=guard_active and PHANTOM_RUNG_CHECK,
+                phantom_legit_person_bboxes=legit_person_boxes,
             )
         elif use_tiled:
             # Single-pass tiled path (high strength, no base). Each tile is a
@@ -1149,6 +1574,12 @@ def generate_pixel_art(
                 # InstantID per-tile routing: identity only on face tiles.
                 image_embeds=image_embeds,
                 ip_adapter_scale=effective_ip_scale,
+                control_guidance_start=list(CONTROL_GUIDANCE_START),
+                control_guidance_end=list(CONTROL_GUIDANCE_END),
+                # Skip the IdentityNet entirely on background tiles; pairs
+                # with the pipeline's zero-scale skip.
+                bg_zero_control_indices=[0] if TILE_BG_ZERO_IDENTITY else None,
+                tile_batch_size=TILE_BATCH_SIZE,
             )
             # No coherent base here, so the only global reference for colour
             # matching is the input. Off by default (reference="base"); set
@@ -1169,6 +1600,8 @@ def generate_pixel_art(
                     num_inference_steps=num_inference_steps,
                     strength=img_strength,
                     controlnet_conditioning_scale=control_scales,
+                    control_guidance_start=list(CONTROL_GUIDANCE_START),
+                    control_guidance_end=list(CONTROL_GUIDANCE_END),
                     clip_skip=CLIP_SKIP,
                     generator=generator,
                     width=target_width,
@@ -1180,14 +1613,18 @@ def generate_pixel_art(
         if not guard_active:
             break
 
-        # Count high-confidence faces in the output. The bar
-        # (PHANTOM_FACE_MIN_SCORE) is deliberately above the input gate:
-        # SCRFD can hallucinate on stylised textures, and phantom faces
-        # tend to be the realistic ones it does catch.
-        out_count = len(
-            _detect_faces_insight(output_image, min_score=PHANTOM_FACE_MIN_SCORE)
+        # Positional phantom check, two channels: any output FACE whose
+        # center lies in no (expanded) input face box, and any output
+        # PERSON figure (COCO detector) touching no legit person region —
+        # phantom limbs and whole invented figures are exactly what a
+        # face-only detector is blind to. Detection runs size-capped (see
+        # _detect_faces_scaled) — at 4K the old full-res check couldn't
+        # see the phantoms it was guarding against.
+        phantoms = _find_phantom_bboxes(output_image, expanded_bboxes)
+        phantoms += _find_phantom_person_bboxes(
+            output_image, legit_person_boxes
         )
-        if out_count <= input_face_count:
+        if not phantoms:
             if attempt > 0:
                 gen_notes.append(
                     f"Phantom-face guard: clean output after {attempt} "
@@ -1196,16 +1633,44 @@ def generate_pixel_art(
             break
 
         print(
-            f"[Generator] Phantom-face guard: {out_count} face(s) in output "
-            f"vs {input_face_count} in input (attempt {attempt + 1}/{max_attempts})"
+            f"[Generator] Phantom guard: {len(phantoms)} phantom "
+            f"region(s) (faces/figures) vs {input_face_count} input "
+            f"face(s) (attempt {attempt + 1}/{max_attempts})"
         )
+
+        # Repair before re-rolling: the coherent base pass is phantom-free
+        # by construction — feather-paste it over the phantom regions.
+        # Deterministic, local and near-free; the re-roll redoes the base
+        # and every escalation rung for a lottery ticket, so it is now the
+        # FALLBACK (and the only option for paths without a stylised
+        # phantom-free reference, e.g. single-pass tiling).
+        if PHANTOM_REPAIR and base_pass_image is not None:
+            base_ref = base_pass_image.resize(
+                (target_width, target_height), Image.LANCZOS
+            )
+            output_image = _erase_phantoms(
+                output_image, base_ref, phantoms, PHANTOM_REPAIR_DILATE
+            )
+            remaining = _find_phantom_bboxes(output_image, expanded_bboxes)
+            if not remaining:
+                gen_notes.append(
+                    f"Phantom guard: {len(phantoms)} phantom region(s) "
+                    "erased locally from the coherent base (no re-roll)."
+                )
+                break
+            phantoms = remaining
+            print(
+                f"[Generator] Phantom repair left {len(phantoms)} "
+                "face(s) — falling back to seed re-roll"
+            )
+
         if attempt < max_attempts - 1:
             actual_seed = create_seed(-1)
             print(f"[Generator] Re-rolling seed -> {actual_seed}")
         else:
             gen_notes.append(
-                f"Phantom-face guard: output still has {out_count} face(s) vs "
-                f"{input_face_count} in input after {PHANTOM_FACE_MAX_RETRIES} "
+                f"Phantom guard: output still has {len(phantoms)} "
+                f"phantom region(s) after {PHANTOM_FACE_MAX_RETRIES} "
                 f"retry(ies) — returning last result."
             )
 

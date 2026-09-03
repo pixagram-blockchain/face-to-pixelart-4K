@@ -21,6 +21,7 @@ import numpy as np
 import PIL.Image
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from diffusers import StableDiffusionXLControlNetImg2ImgPipeline
 from diffusers.image_processor import PipelineImageInput
@@ -35,14 +36,6 @@ from diffusers.utils import (
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module, is_torch_version
 
-
-try:
-    import xformers
-    import xformers.ops
-
-    xformers_available = True
-except Exception:
-    xformers_available = False
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -162,6 +155,15 @@ class Resampler(nn.Module):
 class AttnProcessor(nn.Module):
     r"""
     Default processor for performing attention-related computations.
+
+    SDPA implementation: uses the PyTorch >= 2.0 fused
+    `F.scaled_dot_product_attention` kernel (flash / memory-efficient
+    attention) instead of the original naive path
+    (`attn.get_attention_scores` + `torch.bmm`), which materialised the full
+    (seq x seq) attention matrix. `set_ip_adapter` installs this class on
+    EVERY self-attention layer of the UNet, so the naive path dominated
+    per-step cost and VRAM. Kept as a parameter-free `nn.Module` so the
+    `ip_layers.load_state_dict` indexing in `set_ip_adapter` is unchanged.
     """
 
     def __init__(
@@ -170,6 +172,11 @@ class AttnProcessor(nn.Module):
         cross_attention_dim=None,
     ):
         super().__init__()
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError(
+                "AttnProcessor requires PyTorch 2.0+ "
+                "(torch.nn.functional.scaled_dot_product_attention)."
+            )
 
     def __call__(
         self,
@@ -193,7 +200,11 @@ class AttnProcessor(nn.Module):
         batch_size, sequence_length, _ = (
             hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
         )
-        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+            # scaled_dot_product_attention expects (batch, heads, q_len, kv_len)
+            attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
 
         if attn.group_norm is not None:
             hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
@@ -208,13 +219,20 @@ class AttnProcessor(nn.Module):
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
 
-        query = attn.head_to_batch_dim(query)
-        key = attn.head_to_batch_dim(key)
-        value = attn.head_to_batch_dim(value)
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // attn.heads
 
-        attention_probs = attn.get_attention_scores(query, key, attention_mask)
-        hidden_states = torch.bmm(attention_probs, value)
-        hidden_states = attn.batch_to_head_dim(hidden_states)
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        # Fused attention: no materialised (seq x seq) score matrix.
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        )
+
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = hidden_states.to(query.dtype)
 
         # linear proj
         hidden_states = attn.to_out[0](hidden_states)
@@ -235,6 +253,12 @@ class AttnProcessor(nn.Module):
 class IPAttnProcessor(nn.Module):
     r"""
     Attention processor for IP-Adapater.
+
+    SDPA implementation: both the text branch and the identity (IP) branch
+    use the fused `F.scaled_dot_product_attention` kernel. The original code
+    only had a fast path via xformers (not installed here) and otherwise fell
+    back to the naive materialised-score path.
+
     Args:
         hidden_size (`int`):
             The hidden size of the attention layer.
@@ -248,6 +272,12 @@ class IPAttnProcessor(nn.Module):
 
     def __init__(self, hidden_size, cross_attention_dim=None, scale=1.0, num_tokens=4):
         super().__init__()
+
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError(
+                "IPAttnProcessor requires PyTorch 2.0+ "
+                "(torch.nn.functional.scaled_dot_product_attention)."
+            )
 
         self.hidden_size = hidden_size
         self.cross_attention_dim = cross_attention_dim
@@ -279,7 +309,11 @@ class IPAttnProcessor(nn.Module):
         batch_size, sequence_length, _ = (
             hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
         )
-        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+            # scaled_dot_product_attention expects (batch, heads, q_len, kv_len)
+            attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
 
         if attn.group_norm is not None:
             hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
@@ -301,30 +335,31 @@ class IPAttnProcessor(nn.Module):
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
 
-        query = attn.head_to_batch_dim(query)
-        key = attn.head_to_batch_dim(key)
-        value = attn.head_to_batch_dim(value)
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // attn.heads
 
-        if xformers_available:
-            hidden_states = self._memory_efficient_attention_xformers(query, key, value, attention_mask)
-        else:
-            attention_probs = attn.get_attention_scores(query, key, attention_mask)
-            hidden_states = torch.bmm(attention_probs, value)
-        hidden_states = attn.batch_to_head_dim(hidden_states)
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
-        # for ip-adapter
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        )
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = hidden_states.to(query.dtype)
+
+        # for ip-adapter (identity tokens) — same fused kernel
         ip_key = self.to_k_ip(ip_hidden_states)
         ip_value = self.to_v_ip(ip_hidden_states)
 
-        ip_key = attn.head_to_batch_dim(ip_key)
-        ip_value = attn.head_to_batch_dim(ip_value)
+        ip_key = ip_key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        ip_value = ip_value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
-        if xformers_available:
-            ip_hidden_states = self._memory_efficient_attention_xformers(query, ip_key, ip_value, None)
-        else:
-            ip_attention_probs = attn.get_attention_scores(query, ip_key, None)
-            ip_hidden_states = torch.bmm(ip_attention_probs, ip_value)
-        ip_hidden_states = attn.batch_to_head_dim(ip_hidden_states)
+        ip_hidden_states = F.scaled_dot_product_attention(
+            query, ip_key, ip_value, attn_mask=None, dropout_p=0.0, is_causal=False
+        )
+        ip_hidden_states = ip_hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        ip_hidden_states = ip_hidden_states.to(query.dtype)
 
         hidden_states = hidden_states + self.scale * ip_hidden_states
 
@@ -341,14 +376,6 @@ class IPAttnProcessor(nn.Module):
 
         hidden_states = hidden_states / attn.rescale_output_factor
 
-        return hidden_states
-
-    def _memory_efficient_attention_xformers(self, query, key, value, attention_mask):
-        # TODO attention_mask
-        query = query.contiguous()
-        key = key.contiguous()
-        value = value.contiguous()
-        hidden_states = xformers.ops.memory_efficient_attention(query, key, value, attn_bias=attention_mask)
         return hidden_states
 
 
@@ -521,7 +548,10 @@ class StableDiffusionXLInstantIDImg2ImgPipeline(StableDiffusionXLControlNetImg2I
             if isinstance(attn_processor, IPAttnProcessor):
                 attn_processor.scale = scale
 
-    def _encode_prompt_image_emb(self, prompt_image_emb, device, dtype, do_classifier_free_guidance):
+    def _encode_prompt_image_emb(
+        self, prompt_image_emb, device, batch_size, num_images_per_prompt, dtype,
+        do_classifier_free_guidance,
+    ):
         if isinstance(prompt_image_emb, torch.Tensor):
             prompt_image_emb = prompt_image_emb.clone().detach()
         else:
@@ -536,6 +566,24 @@ class StableDiffusionXLInstantIDImg2ImgPipeline(StableDiffusionXLControlNetImg2I
             prompt_image_emb = torch.cat([prompt_image_emb], dim=0)
         image_proj_model_device = self.image_proj_model.to(device)
         prompt_image_emb = image_proj_model_device(prompt_image_emb)
+
+        # Tile the projected identity tokens to the actual batch. The
+        # original code assumed batch_size == 1, which broke batched
+        # (multi-tile) calls: prompt_embeds arrive as [B(*2), seq, dim]
+        # while the identity tokens stayed [1(*2), tokens, dim]. Repeat
+        # PER CFG HALF so the layout keeps matching
+        # torch.cat([negative_prompt_embeds, prompt_embeds]) downstream
+        # (uncond block first, then all cond samples).
+        repeat_by = int(batch_size) * int(num_images_per_prompt)
+        if repeat_by > 1:
+            if do_classifier_free_guidance:
+                neg_emb, pos_emb = prompt_image_emb.chunk(2, dim=0)
+                prompt_image_emb = torch.cat(
+                    [neg_emb.repeat(repeat_by, 1, 1), pos_emb.repeat(repeat_by, 1, 1)],
+                    dim=0,
+                )
+            else:
+                prompt_image_emb = prompt_image_emb.repeat(repeat_by, 1, 1)
         return prompt_image_emb
 
     @torch.no_grad()
@@ -817,12 +865,12 @@ class StableDiffusionXLInstantIDImg2ImgPipeline(StableDiffusionXLControlNetImg2I
         )
 
         # 3.2 Encode image prompt
+        # num_images_per_prompt and batch tiling are handled inside (per CFG
+        # half), so no further repeat is needed here.
         prompt_image_emb = self._encode_prompt_image_emb(
-            image_embeds, device, self.unet.dtype, self.do_classifier_free_guidance
+            image_embeds, device, batch_size, num_images_per_prompt,
+            self.unet.dtype, self.do_classifier_free_guidance
         )
-        bs_embed, seq_len, _ = prompt_image_emb.shape
-        prompt_image_emb = prompt_image_emb.repeat(1, num_images_per_prompt, 1)
-        prompt_image_emb = prompt_image_emb.view(bs_embed * num_images_per_prompt, seq_len, -1)
 
         # 4. Prepare image and controlnet_conditioning_image
         image = self.image_processor.preprocess(image, height=height, width=width).to(dtype=torch.float32)
@@ -941,7 +989,12 @@ class StableDiffusionXLInstantIDImg2ImgPipeline(StableDiffusionXLControlNetImg2I
 
         prompt_embeds = prompt_embeds.to(device)
         add_text_embeds = add_text_embeds.to(device)
-        add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
+        # NOTE: no .repeat() here — add_time_ids was already repeated to the
+        # full batch above (and its negative half likewise before the CFG
+        # cat). The original code repeated it AGAIN at this point, which was
+        # a silent no-op at batch_size 1 but produced B*B time-id rows for
+        # any real batch, crashing the ControlNet/UNet add_embedding.
+        add_time_ids = add_time_ids.to(device)
         encoder_hidden_states = torch.cat([prompt_embeds, prompt_image_emb], dim=1)
 
         # 8. Denoising loop
@@ -985,18 +1038,51 @@ class StableDiffusionXLInstantIDImg2ImgPipeline(StableDiffusionXLControlNetImg2I
                         controlnet_cond_scale = controlnet_cond_scale[0]
                     cond_scale = controlnet_cond_scale * controlnet_keep[i]
 
-                down_block_res_samples, mid_block_res_sample = self.controlnet(
-                    control_model_input,
-                    t,
-                    encoder_hidden_states=prompt_image_emb,
-                    controlnet_cond=control_image,
-                    conditioning_scale=cond_scale,
-                    guess_mode=guess_mode,
-                    added_cond_kwargs=controlnet_added_cond_kwargs,
-                    return_dict=False,
-                )
+                # ControlNet(s) inference — nets whose effective conditioning
+                # scale is 0 at this step are SKIPPED entirely. Numerically
+                # identical: ControlNetModel multiplies its residuals by the
+                # scale internally, so a zero-scale net contributes exactly
+                # zero — but the stock MultiControlNet path still paid its
+                # full forward. This makes txt2img (both scales 0),
+                # identity-off jobs, zeroed background tiles and
+                # control_guidance_end < 1.0 actually cheaper. When every net
+                # is skipped, the UNet receives None residuals (a no-op).
+                _nets = getattr(self.controlnet, "nets", None)
+                if _nets is not None:
+                    _scales = cond_scale if isinstance(cond_scale, list) else [cond_scale] * len(_nets)
+                    _cond_images = control_image
+                else:
+                    _nets = [self.controlnet]
+                    _scales = [cond_scale]
+                    _cond_images = [control_image]
 
-                if guess_mode and self.do_classifier_free_guidance:
+                down_block_res_samples, mid_block_res_sample = None, None
+                for _net, _cond_img, _scale in zip(_nets, _cond_images, _scales):
+                    if _scale == 0.0:
+                        continue
+                    _down, _mid = _net(
+                        control_model_input,
+                        t,
+                        encoder_hidden_states=prompt_image_emb,
+                        controlnet_cond=_cond_img,
+                        conditioning_scale=_scale,
+                        guess_mode=guess_mode,
+                        added_cond_kwargs=controlnet_added_cond_kwargs,
+                        return_dict=False,
+                    )
+                    if down_block_res_samples is None:
+                        down_block_res_samples, mid_block_res_sample = list(_down), _mid
+                    else:
+                        down_block_res_samples = [
+                            a + b for a, b in zip(down_block_res_samples, _down)
+                        ]
+                        mid_block_res_sample = mid_block_res_sample + _mid
+
+                if (
+                    guess_mode
+                    and self.do_classifier_free_guidance
+                    and mid_block_res_sample is not None
+                ):
                     # Infered ControlNet only for the conditional batch.
                     # To apply the output of ControlNet to both the unconditional and conditional batches,
                     # add 0 to the unconditional batch to keep it unchanged.

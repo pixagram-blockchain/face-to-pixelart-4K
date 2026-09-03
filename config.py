@@ -44,7 +44,14 @@ class Config:
     # ============================================================
     REPO_ID = "primerz/pixagram"
     CHECKPOINT_FILENAME = "horizon.safetensors"
-    LORA_FILENAME = "retroart.safetensors"
+    # OPTIONAL: a diffusers-layout export of the same checkpoint (see
+    # convert_to_diffusers.py). When set (e.g. "primerz/pixagram-horizon"),
+    # the pipeline loads via from_pretrained with fp16 variant shards —
+    # noticeably faster cold boots than parsing the 7GB single file. Leave
+    # empty to keep loading CHECKPOINT_FILENAME via from_single_file.
+    DIFFUSERS_LAYOUT_REPO = ""
+    LORA_FILENAME = "retroart.safetensors"  # SUPERSEDED by LORA_STYLES below;
+                                            # kept for back-compat only.
     LORA_STRENGTH = 1.25  # DEPRECATED: see DEFAULT_LORA_INTENSITY. No longer
                           # fused. Kept only for back-compat.
 
@@ -57,8 +64,8 @@ class Config:
     # during diffusion, so more style is safe and adds pixel-art punch);
     # non-faces are attenuated to avoid the over-cooked / artifacted look.
     DEFAULT_LORA_INTENSITY = 0.75
-    LORA_FACE_MULTIPLIER = 1.2
-    LORA_NOFACE_MULTIPLIER = 0.6
+    LORA_FACE_MULTIPLIER = 1.0
+    LORA_NOFACE_MULTIPLIER = 0.5
     # Hard clamp on the effective scale after multiplication.
     LORA_INTENSITY_MAX = 2.0
 
@@ -73,39 +80,71 @@ class Config:
     IMG_STRENGTH_MIN = 0.1
     IMG_STRENGTH_MAX = 1.0
 
-    DEFAULT_GUIDANCE_SCALE = 1.2
+    # LCM guidance. 1.0 = CFG OFF: the UNet and BOTH ControlNets run a
+    # single batch instead of two (~1.8x faster diffusion) and negative
+    # prompts are ignored. Any value > 1.0 doubles every step. The old 1.2
+    # default paid the full 2x price for a CFG its own comments called
+    # "nearly inert" — face jobs that genuinely need the anti-duplication
+    # negatives are auto-raised to FACE_GUIDANCE_MIN instead.
+    DEFAULT_GUIDANCE_SCALE = 1.0
     DEFAULT_NUM_INFERENCE_STEPS = 10
     DEFAULT_SEED = 42
 
-    # Trigger Words for the LoRA
-    STYLE_TRIGGER1 = "HD detailed pixel art artwork and high quality detailed art illustration in retroart style"
-    STYLE_TRIGGER2 = "artwork, illustration, pixel art, retro game art portrait, art."
-    # Combined trigger word used by the generation pipeline
+    # ------------------------------------------------------------------
+    # SELECTABLE LoRA STYLES
+    # Each entry maps a style key to its weight file (in REPO_ID) and its
+    # trigger pair. trigger1 + ", " + trigger2 reproduces the full trigger
+    # prompt VERBATIM as specified. trigger2 carries the "portrait" token,
+    # which the generator strips for face-free content (both styles share
+    # the same trigger2).
+    LORA_STYLES = {
+        "retroart": {
+            "weight_name": "retroart.safetensors",
+            "trigger1": "HD detailed pixel art artwork and high quality detailed art illustration in retroart style",
+            "trigger2": "artwork, illustration, pixel art, retro game art portrait, art.",
+        },
+        "vga": {
+            "weight_name": "vga.safetensors",
+            "trigger1": "HD detailed pixel art artwork and high quality detailed art illustration in dosvga style",
+            "trigger2": "artwork, illustration, pixel art, retro game art portrait, art.",
+        },
+    }
+    DEFAULT_LORA_STYLE = "retroart"
+
+    # Back-compat aliases (= the retroart style). Kept because parts of the
+    # codebase and external scripts import these names directly.
+    STYLE_TRIGGER1 = LORA_STYLES["retroart"]["trigger1"]
+    STYLE_TRIGGER2 = LORA_STYLES["retroart"]["trigger2"]
+    # Combined trigger word (retroart) used by the generation pipeline
     TRIGGER_WORD = STYLE_TRIGGER1 + ", " + STYLE_TRIGGER2
-    # Default Negative Prompt
+    # Default Negative Prompt (applies to BOTH LoRA styles)
     DEFAULT_NEGATIVE_PROMPT = "Ugly, artifacts, blurry, disformed, photo-realistic, photo, photography, realistic, low-quality, text, white edges, white border, pixel art, squares, crisp-edge, squared."
 
     # Extra negative-prompt tokens appended ONLY when insightface confirmed NO
     # face. Actively suppresses the portrait-biased retroart LoRA from
-    # inventing a face in faceless images. NOTE: with LCM at guidance ~1.2
-    # CFG is weak, so this is a *secondary* lever — the primary phantom-face
+    # inventing a face in faceless images. NOTE: at the default guidance 1.0
+    # CFG is OFF and negatives are ignored entirely — the primary phantom-face
     # fix is keeping face nouns out of the POSITIVE prompt (see generator.py's
-    # _scrub_person_tokens). Raising guidance for the no-face branch gives
-    # this addon more teeth.
+    # _scrub_person_tokens). This addon only acts when guidance > 1 (via the
+    # UI slider or FACE_GUIDANCE_MIN).
     NOFACE_NEGATIVE_ADDON = (
         "face, human face, person, people, portrait, eyes, facial features, "
-        "man, woman, child, human, figure"
+        "man, woman, child, human, figure, humanoid, silhouette, character, "
+        "sprite, body, arms, hands, legs, limbs, torso"
     )
 
     # Extra negative-prompt tokens appended when EXACTLY ONE face was
     # confirmed. Suppresses the duplicate-face failure mode where the
     # portrait-loaded prompt + portrait-biased LoRA paint a second face
     # onto hair/shoulders/background blobs. Gated to single-face inputs
-    # so it never fights legitimate group photos. Weak at LCM CFG ~1.2,
-    # which is why FACE_GUIDANCE_MIN below raises guidance on face jobs.
+    # so it never fights legitimate group photos. Inert at the default
+    # guidance 1.0 (CFG off), which is why FACE_GUIDANCE_MIN below raises
+    # guidance on face jobs so these negatives can act.
     FACE_NEGATIVE_ADDON = (
         "multiple faces, extra face, second face, duplicated face, "
-        "second person, twins, clone, crowd"
+        "second person, twins, clone, crowd, extra limbs, extra arms, "
+        "extra hands, extra legs, disembodied limbs, disembodied hand, "
+        "floating head"
     )
 
     # Positive-prompt tokens appended when exactly ONE face was confirmed.
@@ -113,15 +152,65 @@ class Config:
     # this is the cheap anti-duplication lever.
     SOLO_PROMPT_ADDON = ""
 
-    # Guidance floor for confirmed-face jobs. At the 1.2 default the
-    # negative prompt is nearly inert, so the anti-duplication negatives
-    # need real CFG to act. LCM handles up to ~2.0 fine. Set 0 to disable.
-    FACE_GUIDANCE_MIN = 0
+    # Positive tokens appended to the BACKGROUND prompt (the face-free
+    # prompt used by non-face tiles, and by every tile in the txt2img
+    # no-face fallback). Positives act even at CFG 1.0 — the only lever
+    # that works when guidance is off — and bias ambiguous texture toward
+    # scenery instead of the LoRA's beloved character sprites.
+    # Deliberately mild: bg tiles can still contain small REAL people from
+    # the source photo (only faces are routed), so aggressive wording like
+    # "empty, uninhabited" could fight legitimate content. Set "" to
+    # disable.
+    BG_POSITIVE_ADDON = "background scenery, environment"
+
+    # Guidance floor for confirmed-face jobs. At the 1.0 default CFG is
+    # off and the negative prompt is ignored entirely, so the
+    # anti-duplication negatives need real CFG to act. Face jobs opt back
+    # into the 2x CFG cost deliberately — everything else stays at 1.0.
+    # LCM handles up to ~2.0 fine. Set 0 to disable.
+    FACE_GUIDANCE_MIN = 1.5
+
+    # Guidance floor for confirmed NO-FACE jobs in TILED mode. Without it
+    # a faceless image runs at CFG 1.0 and NOFACE_NEGATIVE_ADDON is a dead
+    # letter — yet the tiled refine rungs are exactly where the portrait-
+    # biased LoRA pareidolias a rock or bush into a face (a proto-face
+    # invented at rung k sits in rung k+1's init and gets sharpened up the
+    # ladder). The ~1.8x CFG cost is paid only on faceless TILED jobs;
+    # single-pass faceless jobs stay at 1.0 (low strength + depth pin them
+    # well enough not to pay for CFG). Set 0 to disable.
+    NOFACE_GUIDANCE_MIN = 1.5
 
     # ============================================================
     # CONTROLNET CONFIGURATION
     # ============================================================
     CN_ZOE_REPO = "diffusers/controlnet-zoe-depth-sdxl-1.0"
+
+    # Per-ControlNet guidance window, order [identity, depth] — MUST match
+    # the ControlNet order in model.py. Structure is established in the
+    # early steps of the schedule; ending the depth net at 75% skips its
+    # forward on the tail steps (the pipeline now SKIPS zero-scale nets
+    # instead of multiplying their output by 0) with no visible structural
+    # cost. IdentityNet runs the full schedule — likeness benefits from the
+    # late steps. Set [1.0, 1.0] to restore the previous full-schedule
+    # behaviour.
+    CONTROL_GUIDANCE_START = [0.0, 0.0]
+    CONTROL_GUIDANCE_END = [1.0, 0.75]
+
+    # ============================================================
+    # VAE (fp16-fix)
+    # ============================================================
+    # The stock SDXL VAE ships force_upcast=True: every encode/decode moves
+    # the ENTIRE VAE fp16 -> fp32 -> fp16 and runs in fp32 — and the tiled
+    # path pays that dtype churn PER TILE. The fp16-fix VAE is numerically
+    # safe in fp16 (force_upcast False): no churn, ~half the VAE cost and
+    # memory. Same latent space, drop-in.
+    USE_FP16_FIX_VAE = True
+    VAE_REPO = "madebyollin/sdxl-vae-fp16-fix"
+
+    # channels_last memory format for the conv-heavy modules (UNet,
+    # ControlNets, VAE): measurably faster convolutions on Ampere/Ada with
+    # fp16 + SDPA, numerically equivalent (layout only).
+    USE_CHANNELS_LAST = True
 
     # ============================================================
     # INSTANTID (face identity — replaces the masked-canny face lock
@@ -154,8 +243,23 @@ class Config:
     # genuine frontal faces typically score 0.70-0.90 under SCRFD.
     FACE_DET_SCORE_MIN = 0.65
 
-    # Bar for counting faces in the OUTPUT (phantom-face guard).
-    PHANTOM_FACE_MIN_SCORE = 0.75
+    # Bar for phantom-face detection in the OUTPUT. Recalibrated for the
+    # repair-era guard: the old 0.75 assumed phantoms look photoreal, but
+    # a PIXEL-ART-styled phantom scores low on the photo-trained SCRFD
+    # and sailed under the bar. Now that legit faces are protected by
+    # POSITIONAL matching and the remedy is a cheap local base-paste (not
+    # a full re-roll), a false positive costs almost nothing — so the bar
+    # can sit much lower and actually catch stylised phantoms.
+    PHANTOM_FACE_MIN_SCORE = 0.55
+
+    # Lenient SCRFD bar for txt2img ROUTING-ONLY detection on the stylised
+    # base pass. SCRFD is photo-trained: a chunky pixel-art face on the
+    # small base often scores under FACE_DET_SCORE_MIN, and a miss used to
+    # broadcast the full portrait prompt to EVERY refine tile. Misrouting
+    # a tile to "face" merely keeps the main prompt there — cheap — so
+    # this bar is deliberately low. Used only for tile routing, never for
+    # identity or the phantom guard.
+    TXT2IMG_ROUTING_MIN_SCORE = 0.45
 
     # insightface model root (models land in <root>/models/antelopev2).
     DATA_ROOT = _DATA_ROOT
@@ -202,18 +306,74 @@ class Config:
     # Whether InstantID identity preservation is enabled by default in the UI
     DEFAULT_FACE_PRESERVE_ENABLED = True
 
-    # Phantom-face guard: after generation, faces are re-counted in the
-    # output (insightface @ PHANTOM_FACE_MIN_SCORE). If the output has
-    # MORE high-confidence faces than the input, the job is re-run with
-    # a new seed, up to this many extra attempts. Each retry costs a
-    # full generation — keep it small inside the ZeroGPU time window.
-    # With InstantID conditioning phantoms are much rarer; 0 disables.
+    # Phantom-face guard: after generation, faces are re-detected in the
+    # output and matched POSITIONALLY against the (expanded) input face
+    # boxes — any output face whose center lies in no input box is a
+    # phantom. (The old raw-count comparison missed "one phantom appeared
+    # while the real face slipped under the score bar": counts equal,
+    # guard fooled.) When phantoms are found the guard first tries a local
+    # REPAIR from the coherent base (see PHANTOM_REPAIR); only when repair
+    # is unavailable or insufficient is the job re-run with a new seed, up
+    # to this many extra attempts. Each retry costs a full generation —
+    # keep it small inside the ZeroGPU time window. 0 disables the
+    # re-rolls (the local repair still runs).
     PHANTOM_FACE_MAX_RETRIES = 1
+
+    # Long-edge cap (px) for the guard's face detection. insightface
+    # internally squeezes its input to det_size (640): on a 4K canvas a
+    # face becomes a dozen pixels and detection silently fails — i.e. the
+    # guard cannot SEE the phantoms it is guarding against. Detection
+    # therefore runs on a copy resized to this long edge and the boxes are
+    # scaled back. ~1280-1600 keeps faces detector-sized.
+    PHANTOM_DET_LONG_EDGE = 1536
+
+    # Repair phantoms instead of gambling on a seed re-roll (coarse-to-
+    # fine path only): feather-paste the phantom-free coherent BASE pass
+    # (upscaled) over each phantom region. Deterministic, local, costs
+    # seconds — the re-roll redoes the base and every escalation rung and
+    # may phantom again. The seed re-roll remains the fallback for paths
+    # with no stylised phantom-free reference (single-pass tiling).
+    PHANTOM_REPAIR = True
+
+    # Per-edge expansion of a phantom's bbox (fraction of its size) for
+    # the repair mask — the soft ellipse must cover hairline/shoulder
+    # spill around the detected face core.
+    PHANTOM_REPAIR_DILATE = 0.45
+
+    # Also check each escalation rung (not just the final output) and
+    # erase phantoms from that rung's base reference immediately. Catching
+    # a proto-face at rung 1 is far cheaper than at 4K and stops the
+    # rung-over-rung sharpening described at NOFACE_GUIDANCE_MIN. One
+    # capped-size insightface pass per rung — negligible next to the
+    # diffusion.
+    PHANTOM_RUNG_CHECK = True
+
+    # Phantom BODY guard: faces are not the only thing the character-
+    # trained LoRA invents — disembodied limbs, torsos and whole little
+    # figures appear too, and SCRFD (a FACE detector) is blind to all of
+    # them. When enabled, a COCO "person" detector (torchvision Faster
+    # R-CNN MobileNetV3-FPN, ~74 MB, auto-downloaded on first use) scans
+    # the output the way the face guard does: boxes are matched
+    # positionally against LEGIT person regions (persons detected in the
+    # INPUT photo + the expanded input face boxes) and unmatched ones are
+    # erased from the coherent base, with the seed re-roll as fallback.
+    # Runs on the same size-capped copies and per-rung hook as the face
+    # guard. Like the face guard it is img2img-only: a txt2img prompt may
+    # legitimately place people anywhere. Fail-soft — if torchvision or
+    # the weights are unavailable, the channel disables itself.
+    PHANTOM_BODY_CHECK = True
+
+    # COCO score bar for the body channel. The detector is photo-trained,
+    # so stylised figures score low — the bar is deliberately lenient;
+    # false positives only cost a harmless local base-paste (the base is
+    # a faithful stylisation of the input, so pasting it can never delete
+    # anything that was really there).
+    PHANTOM_BODY_MIN_SCORE = 0.5
 
     # ============================================================
     # GENERATION DEFAULTS
     # ============================================================
-    CGF_SCALE = 1.2
+    CGF_SCALE = 1.0  # legacy alias, unused internally — kept for external imports
     STEPS_NUMBER = 10
     IMG_STRENGTH = 0.65
     DEPTH_STRENGTH = 0.75
@@ -291,6 +451,24 @@ class Config:
     # exceeds BASE_PASS_LONG_EDGE in either dimension.
     DEFAULT_USE_TILED = False
 
+    # How many same-group tiles to run through the UNet as ONE batch in
+    # tiled mode. Face and background tiles batch separately. Speedup is
+    # close to linear until the GPU saturates; VRAM scales with it too
+    # (x2 again on face tiles while CFG is active). 4 is comfortable on
+    # 40GB+ cards at 768px tiles; drop to 2 (or 1 = sequential, the
+    # previous behaviour) if OOM. Per-tile noise is seeded identically
+    # either way, so output does not depend on this setting.
+    TILE_BATCH_SIZE = 4
+
+    # Zero the IdentityNet ControlNet on background tiles too (the
+    # IP-Adapter embedding is already zeroed there). Their kps crop is
+    # black, but a ControlNet fed a black map still contributes a small
+    # learned response; zeroing it lets the pipeline SKIP the net entirely
+    # on those tiles (the majority of a big grid). Slightly changes
+    # background-tile output — in the anti-phantom direction. Set False for
+    # bit-compat with the previous behaviour.
+    TILE_BG_ZERO_IDENTITY = True
+
     # ============================================================
     # HIGH-RES STRATEGY: COARSE-TO-FINE (best of both worlds)
     # ============================================================
@@ -345,6 +523,14 @@ class Config:
     # you see tile seams or hue patchwork on big flat areas; raise toward
     # ~0.60 for even more detail at the cost of more drift risk.
     REFINE_STRENGTH = 0.5
+
+    # Refine-strength multiplier for confirmed NO-face img2img jobs. The
+    # faceless base is deliberately conservative (IMG_NOFACE_MULTIPLIER
+    # halves the redraw to stay close to the source) — yet the refine
+    # rungs redrew at the full REFINE_STRENGTH with no identity anchor,
+    # i.e. MORE aggressively than their own base. Trim them the same way.
+    # 1.0 restores the previous behaviour.
+    REFINE_NOFACE_MULTIPLIER = 0.8
 
     # ---- Colour matching (insurance against tile drift) -----------------
     # After the refine pass, transfer the tile mosaic's colour statistics

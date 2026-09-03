@@ -37,3 +37,8 @@ mediapipe
 insightface
 onnxruntime
 
+# Phantom body guard (COCO person detector). torchvision already arrives
+# transitively via controlnet_aux; listed explicitly since generator.py
+# now imports it directly.
+torchvision
+
